@@ -1,0 +1,100 @@
+---
+// 嵌入视图:去文档站外壳,只渲染正文。app 内 HelpDrawer 以 iframe 打开
+// https://docs.stellatrix.icu/embed/<slug>,实现「原控件内打开、不跳页」。
+import { getCollection, render } from 'astro:content';
+import { EMBED_SLUG_ALIASES } from '../../embed-aliases.mjs';
+
+export async function getStaticPaths() {
+  const docs = await getCollection('docs');
+  // 仅生成 zh(根)嵌入页 /embed/<slug>;排除 index 与 en/* 多段 id(app 内帮助用 zh)。
+  const pages = docs.filter((e) => e.id !== 'index' && !e.id.includes('/'));
+  const paths = pages.map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+  // 旧 slug 兼容(见 embed-aliases.mjs):已发出的客户端还在打这些 slug,额外生成一张
+  // 内容取自目标页的嵌入页。真实页面同名时以真实页面为准;目标页不存在直接让构建失败。
+  const byId = new Map(pages.map((e) => [e.id, e]));
+  for (const [alias, target] of Object.entries(EMBED_SLUG_ALIASES)) {
+    if (byId.has(alias)) continue;
+    const entry = byId.get(target);
+    if (!entry) throw new Error(`embed-aliases: ${alias} 指向的文档页 ${target} 不存在`);
+    paths.push({ params: { slug: alias }, props: { entry } });
+  }
+  return paths;
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+const title = entry.data.title ?? entry.id;
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>{title}</title>
+    <link rel="stylesheet" href="/embed.css" />
+  </head>
+  <body>
+    <article class="embed-doc">
+      <h1>{title}</h1>
+      <Content />
+    </article>
+    <div
+      class="embed-feedback"
+      id="embedFeedback"
+      data-doc-feedback
+      data-lang="zh-CN"
+      data-sending="提交中…"
+      data-thanks="感谢你的反馈。"
+      data-fail="提交失败,请稍后再试。"
+      data-rate-limited="提交过于频繁,请稍后再试。"
+    >
+      <span class="ef-q" data-hide-on-done>这对我有帮助？</span>
+      <span class="ef-actions" data-hide-on-done>
+        <button type="button" class="ef-btn" data-vote="up">有帮助</button>
+        <button type="button" class="ef-btn" data-vote="down">没帮助</button>
+      </span>
+      <span class="ef-done" data-fb-status role="status" aria-live="polite" hidden></span>
+    </div>
+    <style>
+      .embed-feedback { max-width: 760px; margin: 8px auto 28px; padding: 12px 22px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; border-top: 1px solid var(--line); }
+      /* 与主站页脚同一条规则:任何带 display 的样式都不许盖掉 hidden。 */
+      .embed-feedback [hidden] { display: none !important; }
+      .ef-q { font-size: 13px; color: var(--ink-2); }
+      .ef-actions { display: inline-flex; gap: 10px; }
+      .ef-btn { font: inherit; font-size: 12px; cursor: pointer; padding: 4px 12px; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--ink); }
+      .ef-btn:hover { border-color: var(--accent); color: var(--accent); }
+      .ef-btn:disabled { cursor: default; opacity: 0.55; }
+      .ef-btn:disabled:hover { border-color: var(--line); color: var(--ink); }
+      .ef-btn[aria-pressed='true'],
+      .ef-btn[aria-pressed='true']:hover { border-color: var(--accent); color: var(--accent); opacity: 1; }
+      .ef-done { font-size: 13px; color: var(--accent); }
+    </style>
+    <script>
+      // 投票交互与主站页脚共用 src/scripts/doc-feedback.js(一次浏览一票、在途锁、超时)。
+      import '../../scripts/doc-feedback.js';
+    </script>
+    <script is:inline>
+      (function () {
+        // 内部文档链接:留在 iframe 内跳 /embed/<slug>,并通知父抽屉同步标题。
+        document.addEventListener('click', function (e) {
+          var a = e.target && e.target.closest ? e.target.closest('a') : null;
+          if (!a) return;
+          var href = a.getAttribute('href') || '';
+          if (href.charAt(0) === '#') return; // 页内锚点,走默认
+          if (/^https?:\/\//i.test(href)) { a.setAttribute('target', '_blank'); a.setAttribute('rel', 'noopener'); return; }
+          var m = href.match(/^\/?(?:embed\/)?([a-z0-9_-]+)\/?(#.*)?$/i);
+          if (m) {
+            e.preventDefault();
+            var slug = m[1], hash = m[2] || '';
+            try { parent.postMessage({ type: 'help-nav', slug: slug }, '*'); } catch (_) {}
+            location.href = '/embed/' + slug + '/' + hash;
+          }
+        });
+        // 打开/切换时把当前标题报给父窗口(抽屉头部同步)。
+        try { parent.postMessage({ type: 'help-ready', title: document.title }, '*'); } catch (_) {}
+      })();
+    </script>
+  </body>
+</html>

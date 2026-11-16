@@ -1,0 +1,150 @@
+"""core.vertex_sa — 共享 Vertex Service Account 加载器。
+
+生产鉴权模式下只允许 user BYOK SA。服务器全局 SA 仅保留给本地/匿名开发模式，
+避免任何登录用户的模型调用 fallback 到平台凭证。
+"""
+from __future__ import annotations
+
+import json as _json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+# rpg/ 根目录（rpg/core/vertex_sa.py → rpg/）
+_RPG_BASE = Path(__file__).resolve().parent.parent
+
+# SEC(H-3): 用户上传的 SA JSON 里 token_uri 决定 google-auth 把「private_key 签名的 JWT」
+# POST 到哪个端点。若不校验,攻击者把 token_uri 改成自己的服务器 → 服务器主动把含凭据的
+# JWT 发给攻击者(SSRF + 凭据外泄)。白名单只允许 Google 官方 token 端点。
+_ALLOWED_SA_TOKEN_URIS = {
+    "https://oauth2.googleapis.com/token",
+    "https://accounts.google.com/o/oauth2/token",
+}
+
+
+def _validate_sa_json(sa: dict) -> None:
+    if not isinstance(sa, dict) or sa.get("type") != "service_account":
+        raise ValueError("SA JSON 非法:type 必须为 service_account")
+    token_uri = sa.get("token_uri") or "https://oauth2.googleapis.com/token"
+    if token_uri not in _ALLOWED_SA_TOKEN_URIS:
+        raise ValueError(f"SA JSON token_uri 不在白名单(疑似 SSRF):{token_uri!r}")
+
+
+def load_sa_credentials(
+    user_id: int | None,
+    api_id: str = "AgentPlatform",
+    allow_platform_fallback: bool = False,
+) -> tuple[Any, str | None]:
+    """返回 (google.oauth2.service_account.Credentials, project_id) 或 (None, None)。
+
+    生产鉴权模式 (require_auth=True):
+      1. user_id 非 None → 从 user_api_credentials 取用户上传的 SA JSON (BYOK)
+      2. 无用户 SA:
+         - allow_platform_fallback=False (默认,LLM 路径): 返 None,绝不 fallback
+         - allow_platform_fallback=True (Embedder 平台兜底): 走全局 SA fallback
+
+    本地/匿名开发模式: 永远允许全局 SA fallback
+
+    Args:
+        allow_platform_fallback: Embedder RAG 路径传 True — 测试服平台为用户
+            兜底 RAG embedding 成本(text-embedding-004 在 Vertex 有免费配额)。
+            LLM 路径保持 False — 严格 BYOK,平台不为用户付 LLM 调用钱。
+    """
+    from google.oauth2 import service_account
+
+    _SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    # 1. 用户级 BYOK
+    if user_id:
+        try:
+            from platform_app.user_credentials import get_credential
+            cred = get_credential(int(user_id), api_id)
+            if cred and cred.get("key"):
+                sa = _json.loads(cred["key"])
+                _validate_sa_json(sa)  # SEC(H-3): token_uri 白名单 + type 校验,防 JWT 外泄到攻击者端点
+                credentials = service_account.Credentials.from_service_account_info(
+                    sa, scopes=_SCOPES,
+                )
+                log.debug("[vertex_sa] user %s: loaded BYOK SA (project=%s)", user_id, sa.get("project_id"))
+                return credentials, sa.get("project_id")
+        except Exception as exc:
+            log.warning("[vertex_sa] user %s BYOK SA load failed: %s", user_id, exc)
+
+    try:
+        from core.config import require_auth as _require_auth
+        if _require_auth() and not allow_platform_fallback:
+            log.debug("[vertex_sa] auth mode: no user BYOK SA; global SA fallback disabled (user_id=%s)", user_id)
+            return None, None
+    except Exception:
+        # 配置读取失败时按更保守的生产策略处理(LLM 路径)。
+        if not allow_platform_fallback:
+            log.warning("[vertex_sa] require_auth check failed; global SA fallback disabled", exc_info=True)
+            return None, None
+
+    # 2. 本地/匿名开发模式可用全局 SA (env 或文件)
+    sa_file: Path | None = None
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if env_path and Path(env_path).exists():
+        sa_file = Path(env_path)
+    else:
+        candidate = _RPG_BASE / "vertex_sa.json"
+        if candidate.exists():
+            sa_file = candidate
+
+    if sa_file:
+        try:
+            with open(sa_file) as f:
+                sa = _json.load(f)
+            credentials = service_account.Credentials.from_service_account_info(
+                sa, scopes=_SCOPES,
+            )
+            log.debug("[vertex_sa] loaded global SA from %s (project=%s)", sa_file, sa.get("project_id"))
+            return credentials, sa.get("project_id")
+        except Exception as exc:
+            log.warning("[vertex_sa] global SA load failed (%s): %s", sa_file, exc)
+
+    log.debug("[vertex_sa] no SA available (user_id=%s)", user_id)
+    return None, None
+
+
+def has_user_sa(user_id: int | None, api_id: str = "AgentPlatform") -> bool:
+    """轻量检查用户是否配置了 SA（不构建 Credentials 对象）。"""
+    if not user_id:
+        return False
+    try:
+        from platform_app.user_credentials import get_credential
+        cred = get_credential(int(user_id), api_id)
+        return bool(cred and cred.get("key"))
+    except Exception:
+        return False
+
+
+VERTEX_SA_MISSING_MESSAGE = (
+    "使用 Agent Platform(Vertex)模型需要先上传 Service Account JSON。"
+    "请到「设置 → API & 模型 → Agent Platform」上传后再试。"
+)
+
+
+def vertex_selection_blocked(user_id: int | None) -> str | None:
+    """选模型/建存档前置校验:该用户选 vertex_ai 是否会在真正调用 LLM 时失败。
+
+    返回 None = 放行；返回 str = 拒绝原因(直接展示给用户)。
+
+    只在生产鉴权模式 (require_auth()=True) 下启用 —— 本地/匿名开发模式允许全局 SA
+    兜底(load_sa_credentials 同一条件),这里必须与之同步,否则会把本地模式误挡死。
+    """
+    try:
+        from core.config import require_auth as _require_auth
+        if not _require_auth():
+            return None
+    except Exception:
+        # 配置读取失败时不拦截(保守放行,避免因配置异常误伤所有用户)。
+        return None
+
+    if has_user_sa(user_id):
+        return None
+
+    return VERTEX_SA_MISSING_MESSAGE

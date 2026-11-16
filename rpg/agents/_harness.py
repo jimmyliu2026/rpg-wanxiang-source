@@ -1,0 +1,942 @@
+"""agents._harness — 统一三通道 LLM JSON 调用。
+
+把 extractor.py:201-378 的 anthropic native tool_use + vertex call_structured +
+openai_compat response_format 三档 dispatch 抽成共享 helper,让 context_agent /
+black_swan_agent / phase_digest_agent 都能复用,消除"两套 harness"技术债。
+
+设计要点:
+- anthropic + tool_schema → native tool_use,input_schema 强校验,错误率比文本 JSON 低 5-10×
+- anthropic 无 schema     → system prompt 里要求 JSON,文本解析(降级)
+- vertex_ai               → call_structured (response_mime_type=application/json)
+- openai/openai_compat    → /chat/completions response_format=json_object,失败降级到无 json_object
+
+签名:
+    call_agent_json(api_id, model, system, user, user_id, *,
+                    tool_schema=None, max_tokens=1024, timeout_sec=30)
+        -> tuple[text: str, usage: dict]
+
+返回 text 总是 JSON 字符串(或 LLM 原始输出,调用方再 parse):
+- anthropic tool_use: tool.input JSON 序列化
+- 其它通道: 模型原始字符串(已经是 JSON 格式)
+
+usage 是 {"input_tokens", "output_tokens", "cached_input_tokens",
+"reasoning_tokens", "total_tokens"};通道不支持时返回 {}。
+"""
+from __future__ import annotations
+
+import json
+import urllib.error
+from typing import Any
+
+from agents.provider_errors import attach_http_error_body
+from core.logging import get_logger
+
+log = get_logger(__name__)
+
+
+def _no_redirect_urlopen(req, *, timeout, proxy=None):
+    """agents 层 urllib LLM 出站的唯一缝(_harness 两条 OpenAI 兼容路径 / extractor / command_agent)。
+
+    SEC(H-4): 出站走 `core.outbound.safe_urlopen` —— 不跟随重定向 + use-time 重解析并把
+    socket pin 到已校验 IP(抗 DNS rebinding)。
+    proxy = credential_proxy(凭据),本地模式才有值;服务器模式恒为 None。
+    失败时把响应体挂到 HTTPError.body 上再抛(attach_http_error_body):urllib 的 HTTPError
+    只带「HTTP Error 410: Gone」,服务商写在响应体里的真实原因(模型下线、未识别参数、
+    上下文超长)不挂上去,provider_errors 就只能看状态码猜。
+    """
+    from core.outbound import proxy_kwargs, safe_urlopen
+
+    try:
+        return safe_urlopen(req, timeout=timeout, **proxy_kwargs(proxy))
+    except urllib.error.HTTPError as exc:
+        attach_http_error_body(exc)
+        raise
+
+
+def micro_task_anthropic_client(resolved: dict, *, timeout_sec: float):
+    """/set 解析(command_agent)、状态抽取(extractor)、验收判定(acceptance_verifier)的 Anthropic
+    裸客户端:读超时 = 调用方的 timeout_sec(连接 10s),SDK 不重试,凭据代理照常带上。
+
+    与这三处的 OpenAI 兼容分支同口径(那边 urllib 按 timeout_sec、不重试)。以前 Anthropic 分支
+    用 llm_timeout_seconds(桌面 1800s)+ SDK 默认 max_retries=2:请求挂住时 /set 这一步最坏把
+    整个回合卡 3 x 1800s。这三处都在失败时降级(返回空 / 退回规则判定),多等一次重试不值。
+    resolved = resolve_api_key(...) 的返回(取 key 与凭据代理)。
+    """
+    import httpx
+    from anthropic import Anthropic
+
+    from core.outbound import credential_proxy, safe_httpx_client
+    t = float(timeout_sec)
+    return Anthropic(
+        api_key=resolved.get("key"),
+        timeout=httpx.Timeout(t, connect=10.0),
+        max_retries=0,
+        http_client=safe_httpx_client(timeout=t, proxy=credential_proxy(resolved)),
+    )
+
+
+def call_agent_json(
+    api_id: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    *,
+    tool_schema: dict | None = None,
+    max_tokens: int = 1024,
+    timeout_sec: int = 30,
+    agent_kind: str | None = None,
+    save_id: int | None = None,
+    context_run_id: int | None = None,
+    metadata_extra: dict | None = None,
+    no_think: bool = False,
+) -> tuple[str, dict]:
+    """三通道 dispatch,返回 (text, usage)。
+
+    tool_schema (可选):
+        Anthropic tool_use 的工具定义,形如
+        {"name": "emit_xxx", "description": "...", "input_schema": {...}}
+        只在 api_id="anthropic" 时启用 native tool_use,其它 provider 忽略。
+
+    agent_kind / save_id / context_run_id / metadata_extra:
+        当 agent_kind + user_id 同时存在时,**内部自动**调
+        `platform_app.usage.record_usage` 写入 token_usage 表,
+        消除"返了 usage 没人 record"的赊账漏洞。
+        agent_kind 用作 metadata.kind(如 "curator" / "black_swan" / "phase_digest")。
+    """
+    # 子代理超时跟随 config.llm_timeout_seconds:慢的本地大模型(桌面自托管跑 Qwen 等)用 30s 必超时
+    # (生产日志实证 curator "read operation timed out")。取 max 不缩短调用方显式值;本地=1800s/服务器=300s。
+    try:
+        from core.config import llm_timeout_seconds as _llm_to
+        timeout_sec = max(int(timeout_sec or 0), int(_llm_to(user_id)))
+    except Exception:
+        pass
+    if api_id == "anthropic":
+        if tool_schema:
+            text, usage = _anthropic_tool_use(
+                model, system_prompt, user_prompt, user_id,
+                tool_schema, max_tokens,
+            )
+        else:
+            text, usage = _anthropic_json_text(
+                model, system_prompt, user_prompt, user_id, max_tokens,
+            )
+    elif api_id == "vertex_ai":
+        if tool_schema:
+            text, usage = _vertex_function_call(
+                model, system_prompt, user_prompt, user_id, tool_schema, max_tokens,
+            )
+        else:
+            text, usage = _vertex_structured(
+                model, system_prompt, user_prompt, user_id, max_tokens,
+                no_think=no_think,
+            )
+    else:
+        # OpenAI 兼容:openai / siliconflow / dashscope / qwen 等
+        if tool_schema:
+            text, usage = _openai_function_call(
+                api_id, model, system_prompt, user_prompt, tool_schema,
+                user_id, timeout_sec, max_tokens,
+                no_think=no_think,
+            )
+        else:
+            # no_think:结构化微任务禁深思(268 实锤:思考模型对判定类 prompt 无界思考,
+            # 6000 token 预算全被 reasoning 吃光正文恒空)。thinking.disabled 为实测有效方言
+            # (op/deepseek-v4-pro 思考归零正文即出);严格 provider 400 拒参时 json_mode 内自愈退参。
+            text, usage = _openai_compat_json_mode(
+                api_id, model, system_prompt, user_prompt,
+                user_id, timeout_sec, max_tokens,
+                extra_body=({"thinking": {"type": "disabled"}} if no_think else None),
+            )
+    _maybe_record_usage(
+        user_id=user_id, save_id=save_id, context_run_id=context_run_id,
+        api_id=api_id, model=model, usage=usage,
+        agent_kind=agent_kind, metadata_extra=metadata_extra,
+    )
+    return text, usage
+
+
+def call_agent_json_guarded(
+    api_id: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    *,
+    log_tag: str = "agent",
+    retry_max_tokens: int | None = None,
+    require_json: bool = False,
+    **kw,
+) -> tuple[str, dict]:
+    """call_agent_json + 空正文护栏(268 实锤范式,与 recorder.record_turn 同款)。
+
+    思考模型对结构化微任务会无界思考吃光 max_tokens 正文恒空;空正文绝不静默当
+    「没有结果」——第一跳空 → log.warning(带 reasoning_tokens 证据)+ 扩预算重试一次;
+    重试仍空 → 原样返回空文本(调用方保留各自的空处理语义),但日志已留痕。
+    重试自身抛异常 → 不向上抛,返回第一跳的空结果(不比不加护栏更糟)。
+    第一跳抛异常则照常向上抛(与裸 call_agent_json 行为一致)。
+
+    require_json=True(2026-08-24,反馈 #99):把护栏从「空正文」扩到「**有正文但不是
+    JSON**」—— 思考模型的失败形态不止「正文全空」,更常见的是正文被推理挤成半截、
+    或者干脆吐一段解释。这两种在调用方眼里都是「没答上来」,待遇应当一致:
+    同样扩预算重试一次(并加一句更硬的只输出 JSON 指令)。仍不可解析则返回**第一跳**
+    原文,由调用方按各自语义处理(留原文是为了能进日志/给用户看,别丢证据)。
+    """
+    # 内层统一关键字传参:既有测试/桩以 `lambda **kwargs` 形态替换 call_agent_json
+    # (调用点原本就是关键字传参),护栏薄层不得把调用形状降级成位置参数。
+    text, usage = call_agent_json(
+        api_id=api_id, model=model, system_prompt=system_prompt,
+        user_prompt=user_prompt, user_id=user_id, **kw)
+    if (text or "").strip():
+        if not require_json:
+            return text, usage
+        from core.json_parse import parse_llm_json
+        if parse_llm_json(text, allow_truncated=True) is not None:
+            return text, usage
+        _mt0 = int(kw.get("max_tokens") or 1024)
+        _retry_mt0 = int(retry_max_tokens or max(_mt0 * 2, 1200))
+        log.warning(
+            "[%s] uid=%s %s·%s 正文解析不出 JSON(前 80 字: %s),扩预算(%s→%s)重试一次",
+            log_tag, user_id, api_id, model,
+            (text or "")[:80].replace("\n", " "), _mt0, _retry_mt0,
+        )
+        kw_json = dict(kw)
+        kw_json["max_tokens"] = _retry_mt0
+        try:
+            text2, usage2 = call_agent_json(
+                api_id=api_id, model=model,
+                system_prompt=system_prompt + "\n\n只输出一个 JSON 对象。不要解释,不要思考过程,不要 markdown 围栏。",
+                user_prompt=user_prompt, user_id=user_id, **kw_json)
+        except Exception as exc:
+            log.warning("[%s] uid=%s 不可解析重试调用失败(%s: %s),按原文返回",
+                        log_tag, user_id, type(exc).__name__, exc)
+            return text, usage
+        if (text2 or "").strip() and parse_llm_json(text2, allow_truncated=True) is not None:
+            return text2, usage2
+        log.warning("[%s] uid=%s 重试仍解析不出 JSON,按第一跳原文返回", log_tag, user_id)
+        return text, usage
+    _rt = int((usage or {}).get("reasoning_tokens") or 0)
+    _mt = int(kw.get("max_tokens") or 1024)
+    _retry_mt = int(retry_max_tokens or max(_mt * 2, 1200))
+    log.warning("[%s] uid=%s %s·%s 返回空正文(reasoning_tokens=%s),扩预算(%s→%s)重试一次",
+                log_tag, user_id, api_id, model, _rt, _mt, _retry_mt)
+    kw2 = dict(kw)
+    kw2["max_tokens"] = _retry_mt
+    try:
+        text2, usage2 = call_agent_json(
+            api_id=api_id, model=model, system_prompt=system_prompt,
+            user_prompt=user_prompt, user_id=user_id, **kw2)
+    except Exception as exc:
+        log.warning("[%s] uid=%s 空正文重试调用失败(%s: %s),按空结果返回",
+                    log_tag, user_id, type(exc).__name__, exc)
+        return text, usage
+    if not (text2 or "").strip():
+        log.warning("[%s] uid=%s 重试仍空正文,按空结果返回(调用方自行处理)", log_tag, user_id)
+    return text2, usage2
+
+
+def _maybe_record_usage(
+    *,
+    user_id: int | None,
+    save_id: int | None,
+    context_run_id: int | None,
+    api_id: str,
+    model: str,
+    usage: dict,
+    agent_kind: str | None,
+    metadata_extra: dict | None,
+    scenario: str = "tool",
+) -> None:
+    """内部自动 record_usage,失败静默(不影响主流程)。
+
+    触发条件:user_id + agent_kind 都非空,且 usage 含至少一个 token 计数。
+    scenario 默认 "tool"（harness 调用均为内部工具 agent）。
+    """
+    if not user_id or not agent_kind or not usage:
+        return
+    if not (usage.get("input_tokens") or usage.get("output_tokens")):
+        return
+    try:
+        from platform_app.usage import record_usage
+        meta = {"kind": agent_kind}
+        if metadata_extra:
+            meta.update(metadata_extra)
+        record_usage(
+            user_id=user_id, save_id=save_id, context_run_id=context_run_id,
+            api_id=api_id, model_real_name=model,
+            usage=usage, metadata=meta, scenario=scenario,
+        )
+    except Exception as exc:
+        log.warning(f"[_harness] record_usage 失败(忽略): {exc}")
+
+
+# ── Anthropic native tool_use ─────────────────────────────────────
+
+def _anthropic_tool_use(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    tool_schema: dict,
+    max_tokens: int,
+) -> tuple[str, dict]:
+    """Anthropic native tool_use,强制 schema 校验。
+
+    模型必须输出 tool_use block;返回 tool.input 的 JSON 序列化。
+    失败(模型不配合)返回 ('{}', usage)。
+    """
+    from anthropic import Anthropic
+
+    from core.outbound import credential_proxy, safe_httpx_client
+    from platform_app.user_credentials import resolve_api_key
+    result = resolve_api_key(user_id, "anthropic", env_fallback="ANTHROPIC_API_KEY")
+    key = result.get("key")
+    if not key:
+        raise RuntimeError("找不到 Anthropic API Key for agent harness")
+    _base_url = result.get("base_url_override") or None
+    _client_kwargs: dict = {"api_key": key,
+                            "http_client": safe_httpx_client(proxy=credential_proxy(result))}
+    if _base_url:
+        _client_kwargs["base_url"] = _base_url
+    client = Anthropic(**_client_kwargs)
+    tool_name = tool_schema.get("name") or "emit_payload"
+    resp = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=_anthropic_cached_system(system_prompt),
+        messages=[{"role": "user", "content": user_prompt}],
+        tools=[tool_schema],
+        tool_choice={"type": "tool", "name": tool_name},
+    )
+    usage = _anthropic_usage(resp)
+    for block in resp.content:
+        if getattr(block, "type", None) == "tool_use" and block.name == tool_name:
+            inp = block.input or {}
+            return json.dumps(inp, ensure_ascii=False), usage
+    # 模型没拿出 tool_use block(罕见)
+    return "{}", usage
+
+
+def _anthropic_json_text(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    max_tokens: int,
+) -> tuple[str, dict]:
+    """Anthropic 无 schema 时:在 system prompt 里要求 JSON,纯文本解析。
+
+    主要给调用方没有定义 tool_schema 的场景兜底。
+    """
+    from anthropic import Anthropic
+
+    from core.outbound import credential_proxy, safe_httpx_client
+    from platform_app.user_credentials import resolve_api_key
+    result = resolve_api_key(user_id, "anthropic", env_fallback="ANTHROPIC_API_KEY")
+    key = result.get("key")
+    if not key:
+        raise RuntimeError("找不到 Anthropic API Key for agent harness")
+    _base_url = result.get("base_url_override") or None
+    _client_kwargs: dict = {"api_key": key,
+                            "http_client": safe_httpx_client(proxy=credential_proxy(result))}
+    if _base_url:
+        _client_kwargs["base_url"] = _base_url
+    client = Anthropic(**_client_kwargs)
+    resp = client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=_anthropic_cached_system(
+            system_prompt + "\n\n严格只输出 JSON,不要 markdown 围栏,不要解释。"
+        ),
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+    usage = _anthropic_usage(resp)
+    parts: list[str] = []
+    for block in resp.content:
+        if getattr(block, "type", None) == "text":
+            parts.append(block.text or "")
+    return "".join(parts), usage
+
+
+def _anthropic_cached_system(system_prompt: str) -> Any:
+    """把 system prompt 包成 cache_control=ephemeral 的 block 列表。
+
+    Anthropic prompt caching 规则:
+    - system 改为 list of blocks,在长 block 末尾加 cache_control={"type":"ephemeral"}
+    - 命中条件:同一 prefix 在 5 分钟内重复请求(对 agent 多次同 prompt 的场景非常划算)
+    - 不足 1024 tokens 时不会缓存(但 API 不会报错,只是不省钱)
+    - 节省 25% 输入成本(cached tokens 按 0.1× 计价)
+
+    长度 < 200 字符的极短 prompt 不值得 cache(走原 string 路径)。
+    """
+    if not system_prompt or len(system_prompt) < 200:
+        return system_prompt
+    return [{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+
+
+def _anthropic_usage(resp: Any) -> dict:
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return {}
+    input_tokens = int(getattr(u, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(u, "output_tokens", 0) or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": int(getattr(u, "cache_read_input_tokens", 0) or 0),
+        "reasoning_tokens": 0,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+# ── Vertex AI (Gemini) ────────────────────────────────────────────
+
+def _vertex_structured(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    max_tokens: int,
+    *,
+    no_think: bool = False,
+) -> tuple[str, dict]:
+    """Vertex call_structured 已设了 response_mime_type=application/json。
+
+    no_think:结构化微任务禁深思(与 openai 分支对称)。此前 no_think 只在 openai 通道消费,
+    vertex 无 tool_schema 走本函数,call_structured 硬编码 thinking_budget=high(默认 8192)→
+    「call_agent_json 必须 no_think」的强约束在 vertex 结构化路径整段失效(生产风险)。"""
+    from agents.gm import _VertexBackend
+    backend = _VertexBackend(model=model, user_id=user_id)
+    # SA 缺失时 VertexBackend.client=None;不先拦就会在 client.models.* 抛 AttributeError
+    # ('NoneType' object has no attribute 'models'),日志难懂。给清晰可行动的凭据错误,
+    # 让上层(context_agent curator / extractor)优雅降级 + 用户知道去配 SA。
+    if backend.client is None:
+        raise RuntimeError(
+            getattr(backend, "_unavailable_message", "")
+            or "Vertex AI 不可用:未配置 Service Account(在「设置 → Agent Platform」上传 SA JSON)"
+        )
+    text = backend.call_structured(
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+        max_tokens=max_tokens,
+        thinking_budget=0 if no_think else None,
+    )
+    usage = getattr(backend, "last_usage", None) or {}
+    return text, dict(usage) if isinstance(usage, dict) else {}
+
+
+def _vertex_function_call(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    tool_schema: dict,
+    max_tokens: int,
+) -> tuple[str, dict]:
+    """Vertex (Gemini) native function calling,强制 schema 校验。
+
+    把 anthropic 风格 tool_schema(name/description/input_schema)翻译为 Gemini
+    FunctionDeclaration,tool_config 设 ANY 模式强制必调函数。错误率比文本 JSON
+    低 5-10×,跟 Anthropic native tool_use 对等。
+
+    返回 (tool.args 序列化 JSON, usage_dict)。
+    """
+    from agents.gm import _VertexBackend
+    backend = _VertexBackend(model=model, user_id=user_id)
+    # SA 缺失 → client=None;先拦,否则 backend.client.models.generate_content 抛
+    # AttributeError('NoneType'...models)(巡检 2026-06-20 抓到:curator harness vertex 路径)。
+    if backend.client is None:
+        raise RuntimeError(
+            getattr(backend, "_unavailable_message", "")
+            or "Vertex AI 不可用:未配置 Service Account(在「设置 → Agent Platform」上传 SA JSON)"
+        )
+    from google.genai import types
+
+    fn_decl = types.FunctionDeclaration(
+        name=tool_schema.get("name", "emit_payload"),
+        description=tool_schema.get("description", ""),
+        parameters=tool_schema.get("input_schema") or {"type": "object", "properties": {}},
+    )
+    tools = [types.Tool(function_declarations=[fn_decl])]
+    tool_config = types.ToolConfig(
+        function_calling_config=types.FunctionCallingConfig(
+            mode="ANY",  # 强制必调,跟 anthropic tool_choice={type:"tool", name:...} 对等
+            allowed_function_names=[fn_decl.name],
+        ),
+    )
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        max_output_tokens=max_tokens,
+        temperature=0.1,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        tools=tools,
+        tool_config=tool_config,
+    )
+    resp = backend.client.models.generate_content(
+        model=backend.model_name,
+        contents=[types.Content(role="user", parts=[types.Part(text=user_prompt)])],
+        config=config,
+    )
+    backend._capture_usage(resp)
+    usage = dict(getattr(backend, "last_usage", None) or {})
+
+    # 抽 function_call.args
+    try:
+        for cand in (resp.candidates or []):
+            for part in (cand.content.parts or []):
+                fc = getattr(part, "function_call", None)
+                if fc and fc.name == fn_decl.name:
+                    args = dict(fc.args or {})
+                    return json.dumps(args, ensure_ascii=False), usage
+    except Exception:
+        pass
+    # 没拿到 function_call(罕见)→ 退化为文本(让调用方 parse)
+    text = getattr(resp, "text", None) or ""
+    return text.strip(), usage
+
+
+# ── OpenAI 兼容 ────────────────────────────────────────────────────
+
+def _resolve_openai_credential(api_id: str, user_id: int | None) -> dict:
+    from core.moneyai import managed_base_url
+    managed_base = managed_base_url(api_id)
+    if managed_base:
+        return {"key": "moneyai-managed", "base_url_override": managed_base, "proxy": None}
+    from platform_app.user_credentials import (
+        resolve_api_key,
+        resolved_auth_token,
+        resolved_is_usable,
+    )
+    cred = resolve_api_key(user_id, api_id)
+    if not resolved_is_usable(cred):
+        raise RuntimeError(f"无 {api_id} 凭证可用于 agent harness")
+    return {**cred, "key": resolved_auth_token(cred)}
+
+
+def _openai_request_headers(api_id: str, key: str) -> dict[str, str]:
+    from core.moneyai import managed_headers
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {key}",
+        **managed_headers(api_id),
+    }
+
+
+def _openai_compat_json_mode(
+    api_id: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    timeout_sec: int,
+    max_tokens: int,
+    extra_body: dict | None = None,
+) -> tuple[str, dict]:
+    """OpenAI / SiliconFlow / DashScope 等:response_format=json_object。
+
+    旧 endpoint 不支持 response_format → 降级到普通 chat.completions。
+    """
+    cred = _resolve_openai_credential(api_id, user_id)
+    import urllib.error
+    import urllib.request
+
+    from core.outbound import credential_proxy, proxy_kwargs
+    # 凭据代理(本地模式才有值);没配时 **{} 让调用形态与改动前一致。
+    _px = proxy_kwargs(credential_proxy(cred))
+    base_url = cred.get("base_url_override") or _api_base_url(api_id)
+    if not base_url:
+        raise RuntimeError(f"未知 base_url for {api_id}")
+    body_dict = {
+        "model": model,
+        "messages": [
+            {"role": "system",
+             "content": system_prompt + "\n\n严格只输出 JSON 对象,不要 markdown,不要解释。"},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "response_format": {"type": "json_object"},
+    }
+    if extra_body:
+        body_dict.update(extra_body)
+    body = json.dumps(body_dict).encode("utf-8")
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=body,
+        method="POST",
+        headers=_openai_request_headers(api_id, cred["key"]),
+    )
+    try:
+        with _no_redirect_urlopen(req, timeout=timeout_sec, **_px) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        choice = (payload.get("choices") or [{}])[0]
+        text = choice.get("message", {}).get("content") or ""
+        if not text and not payload.get("choices"):
+            raise RuntimeError(f"provider 响应结构异常: {str(payload)[:200]}")
+        usage = _openai_usage(payload.get("usage") or {})
+        return text or "", usage
+    except urllib.error.HTTPError as exc:
+        # extras(如 no_think 的 thinking.disabled)被严格 provider 以 400 拒 → 先退参重试一次
+        # (与 tools 形态自愈同思路,代价仅一次被拒未计费请求),不把参数拒绝误判成 response_format 不支持。
+        if exc.code == 400 and extra_body:
+            log.info(f"[_harness] {api_id} 拒绝 extra_body 参数(HTTP 400),退参重试")
+            return _openai_compat_json_mode(
+                api_id, model, system_prompt, user_prompt,
+                user_id, timeout_sec, max_tokens, extra_body=None,
+            )
+        # 仅对 400(endpoint 不支持 response_format)降级重发;5xx/超时/连接错误一律向上抛 ——
+        # 否则把上游瞬时故障误判为「特性不支持」→ 对非幂等 POST 重复请求(重复计费)且掩盖真因。
+        if exc.code != 400:
+            raise
+        body_dict.pop("response_format", None)
+        body = json.dumps(body_dict).encode("utf-8")
+        req = urllib.request.Request(
+            base_url.rstrip("/") + "/chat/completions",
+            data=body, method="POST",
+            headers=_openai_request_headers(api_id, cred["key"]),
+        )
+        with _no_redirect_urlopen(req, timeout=timeout_sec, **_px) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        choice = (payload.get("choices") or [{}])[0]
+        text = choice.get("message", {}).get("content") or ""
+        if not text and not payload.get("choices"):
+            raise RuntimeError(f"provider 响应结构异常: {str(payload)[:200]}")
+        usage = _openai_usage(payload.get("usage") or {})
+        return text or "", usage
+
+
+def _openai_function_call(
+    api_id: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    tool_schema: dict,
+    user_id: int | None,
+    timeout_sec: int,
+    max_tokens: int,
+    no_think: bool = False,
+) -> tuple[str, dict]:
+    """OpenAI / 兼容 endpoint native function calling,强制 schema 校验。
+
+    把 anthropic 风格 tool_schema 翻译为 OpenAI tools format,tool_choice 强制必调。
+    支持的 endpoint:OpenAI / SiliconFlow / DashScope / Qwen / DeepSeek 等。
+    旧 endpoint 不支持 tools 时 → 降级到 response_format json_object。
+
+    no_think:结构化微任务禁深思(268 二连实锤:思考模型 forced tool-call 也会无界思考吃光
+    max_tokens 正文/arguments 恒空——史官 recorder 走本函数,v1.67.1 只接了 json_mode 路径,
+    生产 1200 预算 reasoning_tokens=1200 正文 0 字)。tools 请求体直接带 thinking.disabled;
+    形态被拒降级 json_object 时同样透传,json_mode 内已有 400 退参自愈链,所有组合可自愈。
+
+    返回 (tool.arguments JSON, usage_dict)。
+    """
+    cred = _resolve_openai_credential(api_id, user_id)
+    import urllib.error
+    import urllib.request
+
+    from core.outbound import credential_proxy, proxy_kwargs
+    # 凭据代理(本地模式才有值);没配时 **{} 让调用形态与改动前一致。
+    _px = proxy_kwargs(credential_proxy(cred))
+    base_url = cred.get("base_url_override") or _api_base_url(api_id)
+    if not base_url:
+        raise RuntimeError(f"未知 base_url for {api_id}")
+    tool_name = tool_schema.get("name", "emit_payload")
+    body_dict = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_schema.get("description", ""),
+                "parameters": tool_schema.get("input_schema")
+                              or {"type": "object", "properties": {}},
+            },
+        }],
+        "tool_choice": {"type": "function", "function": {"name": tool_name}},
+    }
+    if no_think:
+        body_dict["thinking"] = {"type": "disabled"}
+    body = json.dumps(body_dict).encode("utf-8")
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/chat/completions",
+        data=body, method="POST",
+        headers=_openai_request_headers(api_id, cred["key"]),
+    )
+    try:
+        with _no_redirect_urlopen(req, timeout=timeout_sec, **_px) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        usage = _openai_usage(payload.get("usage") or {})
+        if not payload.get("choices"):
+            raise RuntimeError(f"provider 响应结构异常: {str(payload)[:200]}")
+        msg = (payload.get("choices") or [{}])[0].get("message", {})
+        tool_calls = msg.get("tool_calls") or []
+        for tc in tool_calls:
+            fn = tc.get("function") or {}
+            if fn.get("name") == tool_name:
+                args_text = fn.get("arguments") or "{}"
+                # arguments 通常是 JSON-encoded string;直接返
+                return args_text, usage
+        # 没拿到 tool_call → 降级到文本内容(让调用方 parse)
+        return msg.get("content") or "{}", usage
+    except urllib.error.HTTPError as exc:
+        # provider 以「请求形态不接受」拒绝 forced function-call 时,降级到 response_format=
+        # json_object 兼容模式重发(同渠道 GM 发纯对话能成,正是因为它不带 tools/tool_choice)。
+        # 群反馈实锤:大量中转(op/xf/…)对子代理的强制工具调用回 403/不支持,而 GM 正常 ——
+        # 根因就是请求形态,不是凭据。判为「形态拒绝」的码:
+        #   400 不支持 tools · 403 网关/WAF 禁掉带 tools 的请求 · 404/405 该 model 无
+        #   function-calling 路由 · 422 参数校验拒 tool_choice。
+        # 401(凭据)/429(限流)/5xx(上游故障)/超时 一律向上抛,交 provider_errors 正确分类,
+        # 不当「tools 不支持」静默降级(避免凭据/限流被掩盖)。降级只多发一次兼容请求:
+        # 真凭据问题时 json_object 仍会同码失败并向上抛,代价仅一次被拒(未计费)的请求。
+        _TOOLS_SHAPE_REJECT = {400, 403, 404, 405, 422}
+        if exc.code not in _TOOLS_SHAPE_REJECT:
+            raise
+        log.warning(f"[_harness] {api_id} 拒绝 tools 请求(HTTP {exc.code}),降级到 json_object 兼容模式")
+        # no_think 透传降级路径:op 等中转拒 tools 后走 json_object,思考模型在那里同样会
+        # 吃光预算;json_mode 对 extra_body 被 400 拒有退参自愈,不会因带参加重降级失败。
+        return _openai_compat_json_mode(
+            api_id, model, system_prompt, user_prompt,
+            user_id, timeout_sec, max_tokens,
+            extra_body=({"thinking": {"type": "disabled"}} if no_think else None),
+        )
+
+
+def _openai_usage(u: dict) -> dict:
+    if not isinstance(u, dict):
+        return {}
+    input_tokens = int(u.get("prompt_tokens") or 0)
+    output_tokens = int(u.get("completion_tokens") or 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cached_input_tokens": int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+        if isinstance(u.get("prompt_tokens_details"), dict) else 0,
+        "reasoning_tokens": int((u.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
+        if isinstance(u.get("completion_tokens_details"), dict) else 0,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def _api_base_url(api_id: str) -> str:
+    # 薄委托 → model_registry.base_url_for(单一真源:live catalog 取 base_url,异常返空)。
+    from model_registry import base_url_for
+    return base_url_for(api_id)
+
+
+# ── 模型偏好解析(给三个 agent 的 api_id/model 优先级解析共用)──────
+
+def resolve_api_and_model(
+    user_id: int | None,
+    *,
+    api_pref_key: str,
+    model_pref_key: str,
+    default_api: str | None = None,
+    default_model: str | None = None,
+    api_id_override: str | None = None,
+    model_override: str | None = None,
+) -> tuple[str, str]:
+    """统一 api_id/model 解析,两级 fallback。
+
+    优先级:
+        1. override(传入参数,如来自 chat_pipeline 透传的 GM api_id)
+        2. user_preferences[<api_pref_key>] / [<model_pref_key>](specific agent)
+        3. user_preferences["agent.api_id"] / ["agent.model_real_name"](通配)
+        4. default
+
+    例:agent="black_swan",黑天鹅没单独配 model,user_preferences 里有
+    "agent.api_id"="anthropic" + "agent.model_real_name"="claude-haiku-4-5"
+    → 黑天鹅自动用 haiku。这是"所有子代理都用便宜模型"场景的常用配置,
+    避免用户重复配 5 个命名空间。
+    """
+    from core.llm_backend import (
+        DEFAULT_FALLBACK_API as _DEFAULT_FALLBACK_API,
+    )
+    from core.llm_backend import (
+        DEFAULT_FALLBACK_MODEL as _DEFAULT_FALLBACK_MODEL,
+    )
+    from core.llm_backend import (
+        first_user_model as _first_user_model,
+    )
+    from core.llm_backend import (
+        guard_byok_usable as _guard_byok_usable,
+    )
+    from core.llm_backend import (
+        resolve_preferred_api as _resolve_api,
+    )
+    from core.llm_backend import (
+        resolve_preferred_model as _resolve_model,
+    )
+    # 兜底默认统一引用 catalog.selected 对齐的常量(消除散落 'vertex_ai'/'gemini-3.5-flash' 漂移)。
+    default_api = default_api or _DEFAULT_FALLBACK_API
+    default_model = default_model or _DEFAULT_FALLBACK_MODEL
+    user_default = _first_user_model(user_id)
+    api_id = (
+        api_id_override
+        or _resolve_api(user_id, pref_key=api_pref_key)
+        or _resolve_api(user_id, pref_key="agent.api_id")
+        or (user_default[0] if user_default else None)
+        or default_api
+    )
+    model = (
+        model_override
+        or _resolve_model(user_id, pref_key=model_pref_key)
+        or _resolve_model(user_id, pref_key="agent.model_real_name")
+        or (user_default[1] if user_default else None)
+        or default_model
+    )
+    # BYOK 守卫:解析出的 provider 用户实际不可用(典型:默认 vertex_ai 或 stale 偏好,
+    # 但用户没传 SA / 没配该 provider 的 key)→ 回退到用户配过 key 的第一个模型。
+    # 否则所有 harness 子代理(curator / acceptance / extractor / 黑天鹅)对没 SA 的
+    # 用户都会抛「未找到 Vertex SA」而整段失败。显式 override 不受此守卫影响。
+    return _guard_byok_usable(
+        user_id, api_id, model,
+        allow_override=bool(api_id_override or model_override),
+    )
+
+
+def call_agent_tool_loop(
+    api_id: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    user_id: int | None,
+    *,
+    tools: list[dict],
+    terminal_tool_name: str,
+    tool_handler: Callable[[str, dict], str | dict],
+    max_iterations: int = 4,
+    max_tokens: int = 1024,
+    agent_kind: str | None = None,
+    save_id: int | None = None,
+    context_run_id: int | None = None,
+) -> tuple[dict | None, dict, list[dict]]:
+    """Anthropic native multi-turn tool use 循环。返回 (terminal_tool_args, usage, trace)。
+
+    trace 是 [(tool_name, args, result), ...] 让 caller 审计 LLM 中间动作。
+    达 max_iterations 仍未调 terminal_tool → 返 (None, usage, trace)。
+
+    非 anthropic provider:暂不支持,抛 NotImplementedError。
+    """
+    from collections.abc import Callable as _Callable  # noqa: F401 (used above for annotation)
+
+    if api_id != "anthropic":
+        raise NotImplementedError(
+            f"call_agent_tool_loop 仅支持 anthropic provider,当前: {api_id}"
+        )
+
+    from anthropic import Anthropic
+
+    from core.outbound import credential_proxy, safe_httpx_client
+    from platform_app.user_credentials import resolve_api_key
+
+    result = resolve_api_key(user_id, "anthropic", env_fallback="ANTHROPIC_API_KEY")
+    key = result.get("key")
+    if not key:
+        raise RuntimeError("找不到 Anthropic API Key for agent tool_loop")
+
+    _base_url = result.get("base_url_override") or None
+    _client_kwargs: dict = {"api_key": key,
+                            "http_client": safe_httpx_client(proxy=credential_proxy(result))}
+    if _base_url:
+        _client_kwargs["base_url"] = _base_url
+    client = Anthropic(**_client_kwargs)
+
+    messages: list[dict] = [{"role": "user", "content": user_prompt}]
+    trace: list[dict] = []
+    cumulative_usage: dict = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+        "total_tokens": 0,
+    }
+
+    for _iteration in range(max_iterations):
+        resp = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=_anthropic_cached_system(system_prompt),
+            messages=messages,
+            tools=tools,
+            tool_choice={"type": "auto"},
+        )
+        # 累计 usage
+        u = _anthropic_usage(resp)
+        for k in cumulative_usage:
+            cumulative_usage[k] += u.get(k, 0)
+
+        # 检查 content blocks
+        tool_uses = [b for b in resp.content if getattr(b, "type", None) == "tool_use"]
+
+        # 是否调了 terminal tool
+        for block in tool_uses:
+            if block.name == terminal_tool_name:
+                _maybe_record_usage(
+                    user_id=user_id, save_id=save_id, context_run_id=context_run_id,
+                    api_id=api_id, model=model, usage=cumulative_usage,
+                    agent_kind=agent_kind, metadata_extra=None,
+                )
+                return block.input or {}, cumulative_usage, trace
+
+        # 没有任何 tool_use → LLM 只返了文本,终止
+        if not tool_uses:
+            break
+
+        # 处理 non-terminal tool_use blocks,构造 tool_result 回应
+        assistant_content = [
+            _block_to_dict(b) for b in resp.content
+        ]
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        tool_results = []
+        for block in tool_uses:
+            raw_result = tool_handler(block.name, block.input or {})
+            if isinstance(raw_result, dict):
+                result_text = json.dumps(raw_result, ensure_ascii=False)
+            else:
+                result_text = str(raw_result)
+            trace.append({"tool_name": block.name, "args": block.input or {}, "result": result_text})
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result_text,
+            })
+        messages.append({"role": "user", "content": tool_results})
+
+    _maybe_record_usage(
+        user_id=user_id, save_id=save_id, context_run_id=context_run_id,
+        api_id=api_id, model=model, usage=cumulative_usage,
+        agent_kind=agent_kind, metadata_extra=None,
+    )
+    return None, cumulative_usage, trace
+
+
+def _block_to_dict(block: Any) -> dict:
+    """把 Anthropic SDK content block 对象序列化为 dict(用于 messages history)。"""
+    btype = getattr(block, "type", None)
+    if btype == "text":
+        return {"type": "text", "text": block.text or ""}
+    if btype == "tool_use":
+        return {
+            "type": "tool_use",
+            "id": block.id,
+            "name": block.name,
+            "input": block.input or {},
+        }
+    # 其它类型 fallback
+    try:
+        return dict(block)
+    except Exception:
+        return {"type": str(btype)}
+
+
+__all__ = ["call_agent_json", "call_agent_tool_loop", "resolve_api_and_model"]

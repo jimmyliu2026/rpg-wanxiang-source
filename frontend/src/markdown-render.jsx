@@ -1,0 +1,359 @@
+/**
+ * markdown-render.jsx — 与 Claude 网页同款的轻量 Markdown 渲染。
+ *
+ * 暴露 window.RpgMarkdown:
+ *   <RpgMarkdown.Block text="..." streaming={false} />
+ *
+ * 支持:
+ *   · 段落 (空行分隔)
+ *   · 标题 # / ## / ###
+ *   · 无序列表 - / *
+ *   · 有序列表 1. / 2.
+ *   · 引用 > ...
+ *   · 代码块 ```lang\n...\n```
+ *   · 行内: **bold** / __bold__ / *italic* / _italic_ / `code` / [text](url) /
+ *           ~~删除线~~
+ *   · 水平线 ---
+ *
+ * 设计:
+ *   block 级 parser 一次扫描产出 AST,再用 React 渲染。
+ *   inline 用 token 化的方式渲染,避免 dangerouslySetInnerHTML (安全 + 流式 OK)。
+ *   流式 (streaming=true) 模式下,允许最后一段未闭合标记 (例如刚打到 `**` 还没第二个 `**`),
+ *   按字面文本显示,等下一帧自然补齐。
+ */
+import React from 'react';
+import './markdown-render.css';
+
+// ── inline 解析 ─────────────────────────────────────────────
+// 顺序很重要: 长 token 在前
+const INLINE_RULES = [
+  // 图片 ![alt](url) 必须在链接规则之前（图片以 ! 起，位置更靠前会被优先选中）
+  { re: /!\[([^\]\n]*?)\]\(([^)\s]+)\)/g, tag: "img" },
+  { re: /\*\*([^*\n]+?)\*\*/g, tag: "strong" },
+  { re: /__([^_\n]+?)__/g, tag: "strong" },
+  { re: /~~([^~\n]+?)~~/g, tag: "del" },
+  { re: /\*([^*\n]+?)\*/g, tag: "em" },
+  { re: /(?<![\w一-鿿])_([^_\n]+?)_(?![\w一-鿿])/g, tag: "em" },
+  { re: /`([^`\n]+?)`/g, tag: "code" },
+  { re: /\[([^\]\n]+?)\]\(([^)\s]+)\)/g, tag: "a" },
+];
+
+// scheme 白名单:只放行 http/https/mailto/tel + 站内相对/锚点。
+// 其余(javascript:/data:/vbscript: 等)一律视为不安全 → 渲染纯文本不带 href(CWE-79)。
+function safeUrl(url) {
+  if (!url) return null;
+  // 去掉控制字符/空白/零宽字符,防 "java\tscript:" / 零宽绕过
+  // eslint-disable-next-line no-control-regex
+  const cleaned = String(url)
+    .replace(/[\u0000-\u0020\u007f-\u00a0\u200b-\u200f\u2028\u2029\ufeff]/g, "")
+    .trim();
+  if (!cleaned) return null;
+  // 带 scheme 的(形如 "xxx:")必须命中白名单;相对路径/锚点(无 scheme)放行
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(cleaned)) {
+    return /^(https?|mailto|tel):/i.test(cleaned) ? cleaned : null;
+  }
+  return cleaned;
+}
+
+// 图片只放行「站内资产」相对路径(生图/存储/头像)。
+// AI 输出的正文可能含 ![](url)；若放任外链会被诱导渲染追踪像素(泄露 IP)或 data: 注入，
+// 故只允许 /api/storage、/api/images、/api/profile/avatar 前缀，其余降级为文本。
+function safeImageUrl(url) {
+  const cleaned = safeUrl(url);
+  if (!cleaned) return null;
+  return /^\/api\/(storage|images|profile\/avatar)\//.test(cleaned) ? cleaned : null;
+}
+
+// 内联图片 + 点击全屏 lightbox。背景用 <span>(fixed 覆盖) 以免在 <p> 内嵌套 <div> 破坏 HTML。
+function MarkdownImage({ src, alt }) {
+  const [open, setOpen] = React.useState(false);
+  React.useEffect(() => {
+    if (!open) return;
+    const h = (e) => { if (e.key === "Escape") setOpen(false); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [open]);
+  return React.createElement(
+    React.Fragment, null,
+    React.createElement("img", {
+      src, alt: alt || "", className: "rpg-md__img", loading: "lazy", decoding: "async",
+      onClick: () => setOpen(true),
+    }),
+    open && React.createElement(
+      "span", { className: "mlb-backdrop", onClick: () => setOpen(false), role: "dialog", "aria-modal": "true" },
+      React.createElement("img", {
+        src, alt: alt || "",
+        style: { maxWidth: "92vw", maxHeight: "90vh", objectFit: "contain", borderRadius: 10, boxShadow: "0 12px 60px rgba(0,0,0,.7)" },
+        onClick: (e) => e.stopPropagation(),
+      })
+    )
+  );
+}
+
+function renderInline(text, keyPrefix) {
+  // 找出所有 match,按位置排序,non-overlap
+  const hits = [];
+  INLINE_RULES.forEach((rule, ri) => {
+    rule.re.lastIndex = 0;
+    let m;
+    while ((m = rule.re.exec(text)) !== null) {
+      hits.push({
+        start: m.index,
+        end: m.index + m[0].length,
+        tag: rule.tag,
+        text: m[1],
+        href: (rule.tag === "a" || rule.tag === "img") ? m[2] : null,
+      });
+    }
+  });
+  hits.sort((a, b) => a.start - b.start || a.end - b.end);
+  // greedy non-overlap
+  const picked = [];
+  let lastEnd = 0;
+  for (const h of hits) {
+    if (h.start >= lastEnd) {
+      picked.push(h);
+      lastEnd = h.end;
+    }
+  }
+  if (!picked.length) return text;
+  const out = [];
+  let cur = 0;
+  let kid = 0;
+  for (const h of picked) {
+    if (h.start > cur) out.push(text.slice(cur, h.start));
+    const k = `${keyPrefix}-${kid++}`;
+    if (h.tag === "a") {
+      const href = safeUrl(h.href);
+      if (href) {
+        out.push(React.createElement("a", {
+          key: k, href, target: "_blank", rel: "noopener noreferrer",
+        }, h.text));
+      } else {
+        // 不安全 scheme(javascript:/data: 等)→ 降级为纯文本,绝不进 href
+        out.push(h.text);
+      }
+    } else if (h.tag === "img") {
+      const isrc = safeImageUrl(h.href);
+      if (isrc) {
+        out.push(React.createElement(MarkdownImage, { key: k, src: isrc, alt: h.text || "" }));
+      } else {
+        // 非站内资产 → 降级为 alt 文本，绝不渲染外链 img
+        out.push(h.text || "");
+      }
+    } else {
+      out.push(React.createElement(h.tag, { key: k }, h.text));
+    }
+    cur = h.end;
+  }
+  if (cur < text.length) out.push(text.slice(cur));
+  return out;
+}
+
+// ── block 级解析 ────────────────────────────────────────────
+function parseBlocks(text) {
+  const lines = (text || "").split("\n");
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    // 空行 → 段落分隔
+    if (!line.trim()) { i++; continue; }
+    // 水平线
+    if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)) {
+      blocks.push({ type: "hr" });
+      i++;
+      continue;
+    }
+    // 标题
+    const hm = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (hm) {
+      blocks.push({ type: "heading", level: hm[1].length, text: hm[2].trim() });
+      i++;
+      continue;
+    }
+    // 代码块
+    if (/^```/.test(line)) {
+      const lang = line.slice(3).trim();
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^```/.test(lines[i])) {
+        buf.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++; // skip closing ```
+      blocks.push({ type: "code", lang, text: buf.join("\n") });
+      continue;
+    }
+    // 引用 - 连续 > 行合并
+    if (/^>\s?/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        buf.push(lines[i].replace(/^>\s?/, ""));
+        i++;
+      }
+      blocks.push({ type: "quote", text: buf.join("\n") });
+      continue;
+    }
+    // 表格 (GFM): 行有 |,下行是分隔线 |---|---|
+    //   | col1 | col2 |
+    //   |------|------|
+    //   | a    | b    |
+    if (line.includes("|") && i + 1 < lines.length
+        && /^\s*\|?\s*:?-{3,}.*\|/.test(lines[i + 1])) {
+      const parseCells = (row) => {
+        let s = row.trim();
+        if (s.startsWith("|")) s = s.slice(1);
+        if (s.endsWith("|")) s = s.slice(0, -1);
+        return s.split("|").map((c) => c.trim());
+      };
+      const header = parseCells(line);
+      // 解析分隔行的对齐 (--- / :--- / ---: / :---:)
+      const sepCells = parseCells(lines[i + 1]);
+      const aligns = sepCells.map((c) => {
+        const trimmed = c.trim();
+        const left = trimmed.startsWith(":");
+        const right = trimmed.endsWith(":");
+        if (left && right) return "center";
+        if (right) return "right";
+        return left ? "left" : null;
+      });
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+        rows.push(parseCells(lines[i]));
+        i++;
+      }
+      blocks.push({ type: "table", header, aligns, rows });
+      continue;
+    }
+    // 无序列表
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*]\s+/, ""));
+        i++;
+      }
+      blocks.push({ type: "ul", items });
+      continue;
+    }
+    // 有序列表
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ""));
+        i++;
+      }
+      blocks.push({ type: "ol", items });
+      continue;
+    }
+    // 段落 - 连续非空非特殊行合并
+    const buf = [line];
+    i++;
+    while (i < lines.length) {
+      const nl = lines[i];
+      if (!nl.trim()) break;
+      if (/^(#{1,6})\s+/.test(nl)) break;
+      if (/^```/.test(nl)) break;
+      if (/^>\s?/.test(nl)) break;
+      if (/^\s*[-*]\s+/.test(nl)) break;
+      if (/^\s*\d+\.\s+/.test(nl)) break;
+      if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(nl)) break;
+      buf.push(nl);
+      i++;
+    }
+    blocks.push({ type: "p", text: buf.join("\n") });
+  }
+  return blocks;
+}
+
+// ── React 渲染 ──────────────────────────────────────────────
+function Block({ text, streaming, className }) {
+  const blocks = React.useMemo(() => parseBlocks(text || ""), [text]);
+  return React.createElement(
+    "div",
+    { className: className || "rpg-md" },
+    ...blocks.map((b, i) => renderBlock(b, i, streaming && i === blocks.length - 1))
+  );
+}
+
+function renderBlock(b, i, isLast) {
+  const k = `b${i}`;
+  if (b.type === "hr") return React.createElement("hr", { key: k });
+  if (b.type === "heading") {
+    return React.createElement(
+      "h" + Math.min(6, b.level), { key: k }, renderInline(b.text, k)
+    );
+  }
+  if (b.type === "code") {
+    return React.createElement(
+      "pre", { key: k, "data-lang": b.lang || "" },
+      React.createElement("code", null, b.text + (isLast ? "" : ""))
+    );
+  }
+  if (b.type === "quote") {
+    // 引用内部允许多行 inline
+    const lines = b.text.split("\n");
+    return React.createElement(
+      "blockquote", { key: k },
+      ...lines.map((ln, j) => React.createElement(
+        "p", { key: `${k}-${j}` }, renderInline(ln, `${k}-${j}`),
+        isLast && j === lines.length - 1 ? React.createElement("span", { className: "gc-cursor", key: "c" }) : null,
+      ))
+    );
+  }
+  if (b.type === "ul") {
+    return React.createElement(
+      "ul", { key: k },
+      ...b.items.map((it, j) => React.createElement(
+        "li", { key: `${k}-${j}` }, renderInline(it, `${k}-${j}`)
+      ))
+    );
+  }
+  if (b.type === "ol") {
+    return React.createElement(
+      "ol", { key: k },
+      ...b.items.map((it, j) => React.createElement(
+        "li", { key: `${k}-${j}` }, renderInline(it, `${k}-${j}`)
+      ))
+    );
+  }
+  if (b.type === "table") {
+    const alignStyle = (a) => a ? { textAlign: a } : null;
+    return React.createElement(
+      "div", { key: k, className: "rpg-md-table-wrap", style: { overflowX: "auto" } },
+      React.createElement(
+        "table", { className: "rpg-md-table" },
+        React.createElement(
+          "thead", null,
+          React.createElement(
+            "tr", null,
+            ...(b.header || []).map((c, ci) => React.createElement(
+              "th", { key: `h${ci}`, style: alignStyle(b.aligns?.[ci]) },
+              renderInline(c, `${k}-h-${ci}`)
+            ))
+          )
+        ),
+        React.createElement(
+          "tbody", null,
+          ...(b.rows || []).map((row, ri) => React.createElement(
+            "tr", { key: `r${ri}` },
+            ...row.map((cell, ci) => React.createElement(
+              "td", { key: `r${ri}c${ci}`, style: alignStyle(b.aligns?.[ci]) },
+              renderInline(cell, `${k}-r${ri}c${ci}`)
+            ))
+          ))
+        )
+      )
+    );
+  }
+  // paragraph (默认)
+  return React.createElement(
+    "p", { key: k },
+    ...[].concat(renderInline(b.text, k)),
+    isLast ? React.createElement("span", { className: "gc-cursor", key: "c" }) : null
+  );
+}
+
+window.RpgMarkdown = { Block, parseBlocks, renderInline };
+export const RpgMarkdown = { Block, parseBlocks, renderInline };

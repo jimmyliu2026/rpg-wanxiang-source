@@ -1,0 +1,640 @@
+"""
+user_cards.py — 用户级 persona / character card CRUD
+
+两个独立资源：
+- persona (card_type='persona')  玩家自己的多个身份，可在任何剧本/存档里选
+- user_card (card_type='pc')     用户自创的 PC 卡，可挂到任何剧本/检索时与剧本卡合并
+
+v28 migration: user_personas 和 user_character_cards 已合并入 character_cards 多态表。
+所有接口严格按 user_id 隔离。
+
+返回格式: 统一 CharacterCardDTO(rpg/platform_app/api/_card_dto.py)。
+  - persona 行额外携带 role 字段(= identity),兼容老前端 .role 访问。
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+from typing import Any
+
+from psycopg.types.json import Jsonb
+
+from platform_app.api._card_dto import card_to_dto
+
+from .db import connect, init_db, limit_value
+
+log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  人设 hash（Phase 4）
+# ══════════════════════════════════════════════════════════════════════
+def compute_persona_hash(card: dict) -> str:
+    """计算人设相关字段的 SHA-256 指纹，用于检测人设是否变化。
+
+    字段顺序：name | identity | appearance | personality | background。
+    缺字段时当空串处理；分隔符使用 ASCII NUL(\\x00)，避免字段内容拼接歧义。
+    """
+    parts = [
+        str(card.get("name") or ""),
+        str(card.get("identity") or ""),
+        str(card.get("appearance") or ""),
+        str(card.get("personality") or ""),
+        str(card.get("background") or ""),
+    ]
+    raw = "\x00".join(parts).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+_SLUG_RE = re.compile(r"[^0-9A-Za-z_一-鿿]+")
+
+# ── avatar_path 前缀白名单（防外部 URL 注入）──────────────────────────
+_AVATAR_PATH_PREFIXES: tuple[str, ...] = (
+    "/api/storage/",
+    "/api/images/file/",
+    "/api/profile/avatar/file/",
+)
+
+
+def _safe_avatar_path(v: object) -> str:
+    """只允许空串或以白名单前缀开头的 avatar_path；否则置空（丢弃外部 URL）。"""
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    if any(s.startswith(prefix) for prefix in _AVATAR_PATH_PREFIXES):
+        return s
+    return ""
+_VALID_SCOPES = {"private", "global", "public"}
+
+
+def _normalize_scope(raw: object) -> str:
+    s = str(raw or "private").strip()
+    return s if s in _VALID_SCOPES else "private"
+
+
+def _slugify(text: str) -> str:
+    cleaned = _SLUG_RE.sub("-", (text or "").strip()).strip("-")
+    return cleaned[:80] or "untitled"
+
+
+def _normalize_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        # 允许逗号/分号/中文顿号分隔
+        return [p.strip() for p in re.split(r"[,，;；、]", value) if p.strip()]
+    return [value]
+
+
+def build_persona_prompt(card: dict[str, Any]) -> str:
+    """从角色卡【全字段】拼一个尽量完整的人设图生成提示词(中文逗号分隔,过滤空字段)。
+
+    用户诉求:人设图提示词要包含角色卡的所有信息。这里覆盖 name/full_name/aliases/
+    identity/appearance/personality/background/speech_style/current_status/secrets/tags
+    (appearance/identity 等视觉相关字段靠前;sample_dialogue=对白,与画面无关,略)。
+    工具调用路径由 LLM 自行决定拼哪些字段,不走此函数。
+    """
+    if not isinstance(card, dict):
+        return "character"
+
+    def _s(k: str) -> str:
+        v = card.get(k)
+        return str(v).strip() if v not in (None, "") else ""
+
+    parts: list[str] = []
+    name = _s("name") or _s("full_name")
+    if name:
+        parts.append(name)
+    if _s("identity"):
+        parts.append(_s("identity"))
+    if _s("appearance"):
+        parts.append(_s("appearance"))
+    for k in ("personality", "background", "speech_style", "current_status", "secrets"):
+        if _s(k):
+            parts.append(_s(k))
+    aliases = card.get("aliases")
+    if isinstance(aliases, (list, tuple)) and aliases:
+        parts.append("，".join(str(a) for a in aliases if a))
+    tags = card.get("tags")
+    if isinstance(tags, (list, tuple)) and tags:
+        parts.append("，".join(str(t) for t in tags if t))
+    elif isinstance(tags, str) and tags.strip():
+        parts.append(tags.strip())
+
+    prompt = "，".join(p for p in parts if p)
+    return prompt or name or "character"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  USER PERSONAS（玩家身份卡，card_type='persona'）
+# ══════════════════════════════════════════════════════════════════════
+def list_personas(user_id: int) -> dict[str, Any]:
+    init_db()
+    with connect() as db:
+        rows = db.execute(
+            "select * from character_cards where user_id = %s and card_type = 'persona' "
+            "order by is_default desc, updated_at desc, id desc",
+            (user_id,),
+        ).fetchall()
+    items = [card_to_dto(r, persona_role_alias=True) for r in rows]
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+def get_persona(user_id: int, persona_id: int) -> dict[str, Any] | None:
+    init_db()
+    with connect() as db:
+        row = db.execute(
+            "select * from character_cards where id = %s and user_id = %s and card_type = 'persona'",
+            (persona_id, user_id),
+        ).fetchone()
+    return card_to_dto(row, persona_role_alias=True) if row else None
+
+
+def upsert_persona(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """创建或更新 persona。payload 至少要有 name；其他字段可选。
+    可传 id 强制更新某条；否则按 slug 决定 insert/update。
+    payload.role 兼容老前端:写到 identity 列。
+    """
+    init_db()
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("persona.name 不能为空")
+    persona_id = payload.get("id")
+    slug = (payload.get("slug") or "").strip() or _slugify(name)
+    is_default = bool(payload.get("is_default"))
+
+    fields = {
+        "name": name,
+        "identity": (payload.get("role") or payload.get("identity") or "").strip(),
+        "background": (payload.get("background") or "").strip(),
+        "appearance": (payload.get("appearance") or "").strip(),
+        "personality": (payload.get("personality") or "").strip(),
+        "avatar_path": _safe_avatar_path(payload.get("avatar_path")),
+        "tags": Jsonb(_normalize_list(payload.get("tags"))),
+        "metadata": Jsonb(payload.get("metadata") or {}),
+        "is_default": is_default,
+    }
+
+    import psycopg.errors as _pg_errors
+    with connect() as db:
+        if persona_id:
+            owned = db.execute(
+                "select 1 from character_cards where id = %s and user_id = %s and card_type = 'persona'",
+                (int(persona_id), user_id),
+            ).fetchone()
+            if not owned:
+                raise ValueError("persona 不存在或无权访问")
+            try:
+                db.execute(
+                    """
+                    update character_cards set
+                      name = %(name)s, slug = %(slug)s, identity = %(identity)s,
+                      background = %(background)s, appearance = %(appearance)s,
+                      personality = %(personality)s,
+                      avatar_path = case when %(avatar_path)s = '' then character_cards.avatar_path else %(avatar_path)s end,
+                      tags = %(tags)s, metadata = %(metadata)s, is_default = %(is_default)s,
+                      row_version = row_version + 1, updated_at = now()
+                    where id = %(id)s and user_id = %(user_id)s and card_type = 'persona'
+                    """,
+                    {**fields, "slug": slug, "id": int(persona_id), "user_id": user_id},
+                )
+            except _pg_errors.UniqueViolation:
+                raise ValueError("slug 已被使用, 请换一个")
+            row = db.execute(
+                "select * from character_cards where id = %s and user_id = %s and card_type = 'persona'",
+                (int(persona_id), user_id),
+            ).fetchone()
+        else:
+            # partial unique index uq_character_cards_user_slug 谓词:
+            #   where card_type in ('pc','persona')
+            # ON CONFLICT 必须显式同样的 WHERE 子句才能匹配该索引。
+            try:
+                row = db.execute(
+                    """
+                    insert into character_cards(
+                      user_id, slug, card_type, source, scope,
+                      first_revealed_chapter, importance,
+                      name, identity, background, appearance,
+                      personality, avatar_path, tags, metadata, is_default
+                    ) values (
+                      %(user_id)s, %(slug)s, 'persona', 'persona', 'private',
+                      1, 100,
+                      %(name)s, %(identity)s, %(background)s, %(appearance)s,
+                      %(personality)s, %(avatar_path)s, %(tags)s, %(metadata)s, %(is_default)s
+                    )
+                    on conflict(user_id, slug, card_type) where card_type in ('pc','persona')
+                    do update set
+                      name = excluded.name, identity = excluded.identity,
+                      background = excluded.background, appearance = excluded.appearance,
+                      personality = excluded.personality,
+                      avatar_path = case when excluded.avatar_path = '' then character_cards.avatar_path else excluded.avatar_path end,
+                      tags = excluded.tags, metadata = excluded.metadata,
+                      is_default = excluded.is_default,
+                      row_version = character_cards.row_version + 1, updated_at = now()
+                    returning *
+                    """,
+                    {**fields, "user_id": user_id, "slug": slug},
+                ).fetchone()
+            except _pg_errors.UniqueViolation:
+                raise ValueError("slug 已被使用, 请换一个")
+
+        # 原子置默认：单条 UPDATE 将同用户所有 persona 的 is_default 设为 (id = 目标id)，
+        # 消除先清零再置位的并发竞争窗口。
+        if is_default and row:
+            db.execute(
+                "update character_cards set is_default = (id = %s)"
+                " where user_id = %s and card_type = 'persona'",
+                (int(row["id"]), user_id),
+            )
+    # Phase 4 钩子：检测 persona_hash 变化，按需入队生图（失败只 log）
+    if row:
+        _card_dto_for_hook = card_to_dto(row, persona_role_alias=True) or {}
+        new_hash = compute_persona_hash(_card_dto_for_hook)
+        _maybe_enqueue_persona_image(user_id, int(row["id"]), new_hash, _card_dto_for_hook)
+    return card_to_dto(row, persona_role_alias=True) or {}
+
+
+def delete_persona(user_id: int, persona_id: int) -> dict[str, Any]:
+    init_db()
+    with connect() as db:
+        cur = db.execute(
+            "delete from character_cards where id = %s and user_id = %s and card_type = 'persona' returning id",
+            (persona_id, user_id),
+        ).fetchone()
+    return {"ok": True, "deleted": bool(cur), "id": persona_id}
+
+
+def set_auto_image_sync(user_id: int, card_id: int, enabled: bool) -> dict[str, Any]:
+    """开启/关闭指定卡的人设图自动同步开关。仅 owner 可操作。"""
+    init_db()
+    with connect() as db:
+        # 人设图家族统一谓词:card_type 限定 pc/persona(同 generate-persona-image)
+        result = db.execute(
+            "update character_cards set auto_image_sync = %s where id = %s and user_id = %s"
+            " and card_type in ('pc', 'persona')",
+            (bool(enabled), int(card_id), user_id),
+        )
+    if result.rowcount == 0:
+        raise ValueError("card 不存在或无权访问")
+    return {"ok": True, "card_id": int(card_id), "auto_image_sync": bool(enabled)}
+
+
+def _maybe_enqueue_persona_image(
+    user_id: int,
+    card_id: int,
+    new_hash: str,
+    row: Any,
+) -> None:
+    """upsert 后钩子：若 persona_hash 有变化则更新 hash，并在 auto_image_sync=true 时入队生图。
+
+    此函数捕获所有异常，失败只 log，不影响 upsert 主流程的返回。
+    """
+    try:
+        with connect() as db:
+            old_row = db.execute(
+                "select persona_hash, auto_image_sync from character_cards where id = %s",
+                (int(card_id),),
+            ).fetchone()
+            if old_row is None:
+                return
+            old_hash: str = str(old_row.get("persona_hash") or "")
+            auto_sync: bool = bool(old_row.get("auto_image_sync"))
+
+            # 无论是否触发生图，都更新 persona_hash
+            if old_hash != new_hash:
+                db.execute(
+                    "update character_cards set persona_hash = %s where id = %s",
+                    (new_hash, int(card_id)),
+                )
+
+        if old_hash != new_hash and auto_sync:
+            # 用角色卡【全字段】拼生图提示串(不再只 4 字段)
+            prompt = build_persona_prompt(dict(row) if isinstance(row, dict) else {"name": str(row.get("name") or "")})
+            try:
+                from platform_app.image_jobs import enqueue_image_generation
+                enqueue_image_generation(
+                    user_id,
+                    prompt=prompt,
+                    kind="persona",
+                    attach={
+                        "type": "persona_image",
+                        "id": int(card_id),
+                        "persona_hash": new_hash,
+                        "source": "auto_sync",
+                    },
+                )
+                log.info(
+                    "[user_cards] persona_image enqueued card_id=%s user=%s",
+                    card_id, user_id,
+                )
+            except Exception as enq_exc:
+                log.warning(
+                    "[user_cards] enqueue_image_generation failed card_id=%s user=%s: %s",
+                    card_id, user_id, enq_exc,
+                )
+    except Exception as exc:
+        log.warning(
+            "[user_cards] _maybe_enqueue_persona_image failed card_id=%s user=%s: %s",
+            card_id, user_id, exc,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  USER CHARACTER CARDS(用户自创 PC 卡, card_type='pc')
+# ══════════════════════════════════════════════════════════════════════
+def list_user_cards(user_id: int, q: str | None = None, enabled_only: bool = False) -> dict[str, Any]:
+    init_db()
+    where = ["user_id = %s", "card_type = 'pc'"]
+    params: list[Any] = [user_id]
+    if enabled_only:
+        where.append("enabled = true")
+    if q:
+        where.append("(lower(name) like %s or lower(identity) like %s)")
+        like = f"%{q.lower()}%"
+        params.extend([like, like])
+    with connect() as db:
+        rows = db.execute(
+            f"select * from character_cards where {' and '.join(where)} "
+            "order by priority desc, updated_at desc, id desc",
+            tuple(params),
+        ).fetchall()
+    items = [card_to_dto(r) for r in rows]
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+def get_user_card(user_id: int, card_id: int) -> dict[str, Any] | None:
+    init_db()
+    with connect() as db:
+        row = db.execute(
+            "select * from character_cards where id = %s and user_id = %s and card_type = 'pc'",
+            (card_id, user_id),
+        ).fetchone()
+    return card_to_dto(row) if row else None
+
+
+def upsert_user_card(user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    init_db()
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("character.name 不能为空")
+    # task 68: 字段长度上限 + 列表数量上限,防 SillyTavern 大卡 / 注入 payload 炸库
+    _MAX_FIELD = 16 * 1024   # 单文本字段 ≤16KB
+    _MAX_LIST = 100          # 单列表 ≤100 元素
+    _MAX_NAME = 200          # 名称类 ≤200 字符
+    if len(name) > _MAX_NAME:
+        raise ValueError(f"character.name 超过 {_MAX_NAME} 字符上限")
+    for text_field in ("full_name", "identity", "background", "appearance", "personality",
+                       "speech_style", "current_status", "secrets"):
+        v = payload.get(text_field)
+        if isinstance(v, str) and len(v) > _MAX_FIELD:
+            raise ValueError(f"character.{text_field} 超过 {_MAX_FIELD} 字符上限")
+    for list_field in ("aliases", "sample_dialogue", "tags"):
+        v = payload.get(list_field)
+        if isinstance(v, list) and len(v) > _MAX_LIST:
+            raise ValueError(f"character.{list_field} 超过 {_MAX_LIST} 元素上限")
+    card_id = payload.get("id")
+    slug = (payload.get("slug") or "").strip() or _slugify(name)
+
+    fields = {
+        "name": name,
+        "slug": slug,
+        "full_name": (payload.get("full_name") or "").strip(),
+        "aliases": Jsonb(_normalize_list(payload.get("aliases"))),
+        "identity": (payload.get("identity") or "").strip(),
+        "background": (payload.get("background") or "").strip(),
+        "appearance": (payload.get("appearance") or "").strip(),
+        "personality": (payload.get("personality") or "").strip(),
+        "speech_style": (payload.get("speech_style") or "").strip(),
+        "current_status": (payload.get("current_status") or "").strip(),
+        "secrets": (payload.get("secrets") or "").strip(),
+        "sample_dialogue": Jsonb(_normalize_list(payload.get("sample_dialogue"))),
+        "tags": Jsonb(_normalize_list(payload.get("tags"))),
+        "metadata": Jsonb(payload.get("metadata") or {}),
+        "token_budget": int(payload.get("token_budget") or 450),
+        "priority": int(payload.get("priority") or 100),
+        "importance": int(payload.get("importance") or 100),  # PC 默认 100,前端高级页可调
+        "enabled": bool(payload.get("enabled", True)),
+        "scope": _normalize_scope(payload.get("scope")),
+        "avatar_path": _safe_avatar_path(payload.get("avatar_path")),
+    }
+
+    # SEC(M-13): metadata JSONB 限长(character_book 经 JSON body 路径可达 nginx 50MB),防存储放大。
+    import json as _json
+    if len(_json.dumps(payload.get("metadata") or {}, ensure_ascii=False).encode("utf-8")) > 256 * 1024:
+        raise ValueError("角色卡 metadata 过大(上限 256KB)")
+
+    with connect() as db:
+        if card_id:
+            owned = db.execute(
+                "select 1 from character_cards where id = %s and user_id = %s and card_type = 'pc'",
+                (int(card_id), user_id),
+            ).fetchone()
+            if not owned:
+                raise ValueError("card 不存在或无权访问")
+            db.execute(
+                """
+                update character_cards set
+                  name=%(name)s, slug=%(slug)s, full_name=%(full_name)s, aliases=%(aliases)s,
+                  identity=%(identity)s, background=%(background)s,
+                  appearance=%(appearance)s, personality=%(personality)s,
+                  speech_style=%(speech_style)s, current_status=%(current_status)s,
+                  secrets=%(secrets)s, sample_dialogue=%(sample_dialogue)s,
+                  tags=%(tags)s, metadata=%(metadata)s,
+                  token_budget=%(token_budget)s, priority=%(priority)s,
+                  importance=%(importance)s, enabled=%(enabled)s, scope=%(scope)s,
+                  avatar_path = case when %(avatar_path)s = '' then character_cards.avatar_path else %(avatar_path)s end,
+                  row_version = row_version + 1, updated_at = now()
+                where id = %(id)s and user_id = %(user_id)s and card_type = 'pc'
+                """,
+                {**fields, "id": int(card_id), "user_id": user_id},
+            )
+            row = db.execute(
+                "select * from character_cards where id = %s and user_id = %s and card_type = 'pc'",
+                (int(card_id), user_id),
+            ).fetchone()
+        else:
+            row = db.execute(
+                """
+                insert into character_cards(
+                  user_id, slug, card_type, source, first_revealed_chapter,
+                  name, full_name, aliases, identity, background, appearance, personality,
+                  speech_style, current_status, secrets, sample_dialogue,
+                  tags, metadata, token_budget, priority, importance, enabled, scope,
+                  avatar_path
+                ) values (
+                  %(user_id)s, %(slug)s, 'pc', 'user', 1,
+                  %(name)s, %(full_name)s, %(aliases)s, %(identity)s, %(background)s,
+                  %(appearance)s, %(personality)s,
+                  %(speech_style)s, %(current_status)s, %(secrets)s, %(sample_dialogue)s,
+                  %(tags)s, %(metadata)s, %(token_budget)s, %(priority)s,
+                  %(importance)s, %(enabled)s, %(scope)s,
+                  %(avatar_path)s
+                )
+                on conflict(user_id, slug, card_type) where card_type in ('pc','persona')
+                do update set
+                  name=excluded.name, full_name=excluded.full_name, aliases=excluded.aliases,
+                  identity=excluded.identity, background=excluded.background,
+                  appearance=excluded.appearance, personality=excluded.personality,
+                  speech_style=excluded.speech_style, current_status=excluded.current_status,
+                  secrets=excluded.secrets, sample_dialogue=excluded.sample_dialogue,
+                  tags=excluded.tags, metadata=excluded.metadata,
+                  token_budget=excluded.token_budget, priority=excluded.priority,
+                  importance=excluded.importance, enabled=excluded.enabled, scope=excluded.scope,
+                  avatar_path = case when excluded.avatar_path = '' then character_cards.avatar_path else excluded.avatar_path end,
+                  row_version = character_cards.row_version + 1, updated_at = now()
+                returning *
+                """,
+                {**fields, "user_id": user_id},
+            ).fetchone()
+    # Phase 4 钩子：pc/persona 卡检测 persona_hash 变化，按需入队生图（失败只 log）
+    if row:
+        _card_dto_for_hook = card_to_dto(row) or {}
+        new_hash = compute_persona_hash(_card_dto_for_hook)
+        _maybe_enqueue_persona_image(user_id, int(row["id"]), new_hash, _card_dto_for_hook)
+    return card_to_dto(row) or {}
+
+
+def delete_user_card(user_id: int, card_id: int) -> dict[str, Any]:
+    init_db()
+    with connect() as db:
+        cur = db.execute(
+            "delete from character_cards where id = %s and user_id = %s and card_type = 'pc' returning id",
+            (card_id, user_id),
+        ).fetchone()
+    return {"ok": True, "deleted": bool(cur), "id": card_id}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  检索辅助:合并 script-level + user-level
+# ══════════════════════════════════════════════════════════════════════
+def user_cards_for_retrieval(user_id: int, names: list[str]) -> list[dict[str, Any]]:
+    """按角色名(含 aliases)匹配用户级 PC 卡,给 context_engine 用。"""
+    if not user_id or not names:
+        return []
+    init_db()
+    name_lc = [n.lower() for n in names if n]
+    with connect() as db:
+        rows = db.execute(
+            "select * from character_cards where user_id = %s and card_type = 'pc' and enabled = true",
+            (user_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        card = card_to_dto(r) or {}
+        candidates = [card.get("name", "").lower()] + [str(a).lower() for a in (card.get("aliases") or [])]
+        if any(n in candidates or any(n in c or c in n for c in candidates) for n in name_lc):
+            out.append(card)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  在线角色卡库(PC 卡:发布 / 浏览 / 完整 clone 到自己集合)
+# ══════════════════════════════════════════════════════════════════════
+def set_card_public(user_id: int, card_id: int, is_public: bool) -> dict[str, Any]:
+    """作者发布/取消公开自己的 PC 卡。仅 owner。"""
+    init_db()
+    with connect() as db:
+        owned = db.execute(
+            "select 1 from character_cards where id=%s and user_id=%s and card_type='pc'",
+            (int(card_id), user_id),
+        ).fetchone()
+        if not owned:
+            raise ValueError("角色卡不存在或无权访问")
+        row = db.execute(
+            """
+            update character_cards
+            set is_public = %s,
+                published_at = case when %s then coalesce(published_at, now()) else null end,
+                updated_at = now()
+            where id = %s and user_id = %s and card_type='pc'
+            returning is_public, published_at
+            """,
+            (bool(is_public), bool(is_public), int(card_id), user_id),
+        ).fetchone()
+    return {"ok": True, "is_public": bool(row["is_public"]),
+            "published_at": str(row["published_at"]) if row["published_at"] else None}
+
+
+def list_public_cards(q: str | None = None, limit: int = 30, offset: int = 0) -> dict[str, Any]:
+    """在线角色卡库:只列 is_public 的 PC 卡 + 作者展示名 + 热度。secrets 不外露。"""
+    init_db()
+    limit = limit_value(limit, default=30, maximum=60)
+    offset = max(0, int(offset))
+    where = ["c.is_public", "c.card_type = 'pc'"]
+    params: list[Any] = []
+    if q:
+        where.append("(lower(c.name) like %s or lower(c.identity) like %s or lower(c.full_name) like %s)")
+        like = f"%{q.lower()}%"
+        params.extend([like, like, like])
+    sql = (
+        "select c.*, u.display_name as owner_name, u.username as owner_username "
+        "from character_cards c join users u on u.id = c.user_id "
+        f"where {' and '.join(where)} "
+        "order by c.published_at desc nulls last, c.id desc limit %s offset %s"
+    )
+    params.extend([limit, offset])
+    with connect() as db:
+        rows = db.execute(sql, tuple(params)).fetchall()
+    items = []
+    for r in rows:
+        dto = card_to_dto(r) or {}
+        dto["is_public"] = True
+        dto["clone_count"] = int(r.get("clone_count") or 0)
+        dto["published_at"] = str(r["published_at"]) if r.get("published_at") else None
+        dto["owner_name"] = r.get("owner_name") or r.get("owner_username") or "匿名作者"
+        dto.pop("secrets", None)  # 列表不暴露作者私密设定(导入后才得完整卡)
+        items.append(dto)
+    return {"ok": True, "items": items, "total": len(items), "limit": limit, "offset": offset}
+
+
+def clone_public_card(user_id: int, card_id: int) -> dict[str, Any]:
+    """把一张公开 PC 卡【完整复制】到当前用户卡库(复制,非指针)。新卡默认私有。"""
+    init_db()
+    with connect() as db:
+        src = db.execute(
+            "select user_id, slug from character_cards where id=%s and is_public and card_type='pc'",
+            (int(card_id),),
+        ).fetchone()
+        if not src:
+            raise ValueError("公开角色卡不存在")
+        if int(src["user_id"]) == int(user_id):
+            raise ValueError("这是你自己的角色卡,无需导入")
+        new_slug = f"{src['slug'] or 'card'}-imp{int(card_id)}"
+        new = db.execute(
+            """
+            insert into character_cards(
+              user_id, slug, card_type, source, first_revealed_chapter,
+              name, full_name, aliases, identity, background, appearance, personality,
+              speech_style, current_status, secrets, sample_dialogue,
+              tags, metadata, token_budget, priority, importance, enabled, scope, avatar_path
+            )
+            select %(uid)s, %(slug)s, 'pc', 'cloned', first_revealed_chapter,
+              name, full_name, aliases, identity, background, appearance, personality,
+              speech_style, current_status, '', sample_dialogue,
+              tags, metadata, token_budget, priority, importance, true, scope, avatar_path
+            from character_cards where id = %(src)s and is_public and card_type='pc'
+            on conflict(user_id, slug, card_type) where card_type in ('pc','persona') do nothing
+            returning id
+            """,
+            {"uid": user_id, "slug": new_slug, "src": int(card_id)},
+        ).fetchone()
+        if not new:
+            raise ValueError("你已导入过这张角色卡")
+        db.execute("update character_cards set clone_count = clone_count + 1 where id = %s", (int(card_id),))
+        # 复制人设图历史行 —— image_url 引用同一站内资产(物理文件不重存,满足「公开卡人设图/历史不存两次」)
+        try:
+            db.execute(
+                """
+                insert into card_persona_images
+                    (card_id, image_url, persona_hash, card_row_version, source, status, is_current, prompt_snapshot)
+                select %(newid)s, image_url, persona_hash, card_row_version, 'cloned', status, is_current, prompt_snapshot
+                  from card_persona_images
+                 where card_id = %(src)s
+                """,
+                {"newid": int(new["id"]), "src": int(card_id)},
+            )
+        except Exception as _persona_clone_exc:
+            log.warning("[user_cards] clone persona images failed new=%s src=%s: %s", new["id"], card_id, _persona_clone_exc)
+    return {"ok": True, "card_id": int(new["id"])}

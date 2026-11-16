@@ -1,0 +1,1927 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import secrets
+import threading
+import time
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from psycopg.errors import UniqueViolation
+from psycopg.types.json import Jsonb
+
+from .db import connect, init_db
+from .security import (
+    calc_age,
+    generate_email_code,
+    hash_email_code,
+    hash_password,
+    normalize_email,
+    normalize_username,
+    verify_email_code,
+    verify_password_with_rehash,
+)
+
+SESSION_DAYS = 14
+
+from core.config import (
+    login_lockout_sec as _login_lockout_sec,
+)
+from core.config import (
+    login_max_fails as _login_max_fails,
+)
+from core.config import (
+    login_window_sec as _login_window_sec,
+)
+from core.config import (
+    min_password_length as _min_password_length,
+)
+
+MIN_PASSWORD_LENGTH = _min_password_length()
+
+# ── 登录速率限制 ──────────────────────────────────────────────────────────
+#
+# 警告: 此速率限制使用进程内 dict 实现。
+# 多 worker 部署（uvicorn --workers N / gunicorn）下，每个 worker 有独立内存，
+# 速率限制 **不在 worker 间共享**，攻击者可以通过轮询 worker 绕过限制。
+# 如需多 worker 部署，请将速率限制迁移至 Redis 或数据库后端。
+#
+LOGIN_MAX_FAILS = _login_max_fails()
+LOGIN_LOCKOUT_SEC = _login_lockout_sec()
+LOGIN_WINDOW_SEC = _login_window_sec()  # 5min 内累计失败计数
+
+# P2-5 修复: 维护双独立 bucket，防止组合 key "ip|username" 可被任一维度绕过
+# per-IP: 30次/10min; per-username: 5次/10min
+_IP_MAX_FAILS = 30
+_IP_WINDOW_SEC = 600  # 10min
+_USER_MAX_FAILS = 5
+_USER_WINDOW_SEC = 600  # 10min
+
+_FAIL_BUCKETS_IP: dict[str, list[float]] = {}    # key=ip → [失败时间戳...]
+_FAIL_BUCKETS_USER: dict[str, list[float]] = {}  # key=username → [失败时间戳...]
+_LOCKED_UNTIL_IP: dict[str, float] = {}          # ip → 解锁时间
+_LOCKED_UNTIL_USER: dict[str, float] = {}        # username → 解锁时间
+
+# 邮箱验证码暴破防护:6 位码(10^6 空间)+ 10min 有效期,原无尝试上限 → 知道受害者
+# 邮箱(注册中)即可暴破。按 email 计失败次数,超 _VERIFY_MAX_FAILS 锁定该窗口(与登录限流同构)。
+_VERIFY_MAX_FAILS = 10
+_VERIFY_WINDOW_SEC = 600  # 10min,与验证码有效期一致
+_VERIFY_FAIL_BUCKETS: dict[str, list[float]] = {}  # email_norm → [失败时间戳...]
+_VERIFY_LOCKED_UNTIL: dict[str, float] = {}        # email_norm → 解锁时间
+
+# 兼容旧接口: _FAIL_BUCKETS/_LOCKED_UNTIL 保留但不再用于登录
+_FAIL_BUCKETS: dict[str, list[float]] = {}  # key="ip|username" → [失败时间戳...]
+_LOCKED_UNTIL: dict[str, float] = {}        # key → 解锁时间
+_FAIL_LOCK = threading.Lock()
+
+# [round-4-P2] confirm_password_reset 的 per-IP 进程内兜底(Redis 宕机时仍限流,
+#   与 Redis 路径阈值一致:600s 窗口 / 30 次)。
+_PWRESET_IP_BUCKETS: dict[str, list[float]] = {}  # ip → [时间戳...]
+_PWRESET_WINDOW_SEC = 600
+_PWRESET_IP_LIMIT = 30
+
+import logging as _logging
+
+_log = _logging.getLogger(__name__)
+
+_PENDING_REGISTER_UA_PREFIX = "rpg-pending-register:v1:"
+
+
+class RateLimited(Exception):
+    """登录被速率限制时抛出"""
+    def __init__(self, retry_after_sec: int, key: str):
+        self.retry_after_sec = retry_after_sec
+        self.key = key
+        super().__init__(f"too many failed logins; retry after {retry_after_sec}s")
+
+
+def _bucket_key(ip: str, username: str) -> str:
+    return f"{ip or '-'}|{(username or '').lower()}"
+
+
+def _check_rate_limit(ip: str, username: str) -> None:
+    # P2-5: 双独立 bucket — per-IP 和 per-username 任一超阈值即拒绝。
+    # Redis 可用时用共享锁定键(跨 worker 一致,根治多 worker 限流 ×N 绕过);
+    # 不可用回落进程内(单进程语义)。
+    ip_key = ip or "-"
+    # [round-3-P2] 用 normalize_username 做规范键(不只 .lower()):调用方虽多已先归一,
+    # 但内部统一规范可彻底消除「同一账号经不同表示得到不同限流桶」的绕过面(只会合并桶,不会放宽)。
+    user_key = normalize_username(username)
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        for scope, k in (("ip", ip_key), ("user", user_key)):
+            rem = redis_bus.lock_remaining(f"login:{scope}:{k}")
+            if rem and rem > 0:
+                raise RateLimited(int(rem), f"{scope}:{k}")
+        return
+    now = time.monotonic()
+    with _FAIL_LOCK:
+        # 检查 IP 锁定
+        unlock_ip = _LOCKED_UNTIL_IP.get(ip_key)
+        if unlock_ip and now < unlock_ip:
+            raise RateLimited(int(unlock_ip - now), f"ip:{ip_key}")
+        elif unlock_ip:
+            _LOCKED_UNTIL_IP.pop(ip_key, None)
+        # 检查 username 锁定
+        unlock_user = _LOCKED_UNTIL_USER.get(user_key)
+        if unlock_user and now < unlock_user:
+            raise RateLimited(int(unlock_user - now), f"user:{user_key}")
+        elif unlock_user:
+            _LOCKED_UNTIL_USER.pop(user_key, None)
+        # 清理窗口外记录（只读，不计数）
+        _FAIL_BUCKETS_IP[ip_key] = [t for t in _FAIL_BUCKETS_IP.get(ip_key, []) if now - t < _IP_WINDOW_SEC]
+        _FAIL_BUCKETS_USER[user_key] = [t for t in _FAIL_BUCKETS_USER.get(user_key, []) if now - t < _USER_WINDOW_SEC]
+
+
+def _ip_budget_exceeded(bucket: str, ip: str, limit: int, window_sec: int = 600) -> bool:
+    """per-IP 「成功也计数」的发件/注册预算闸(Redis,优雅降级)。
+
+    与 _check_rate_limit/_record_login_fail 互补:那两个只在【失败】时计数,
+    对「每次都成功」的注册风暴/邮件轰炸完全无效。本闸对【每次调用】都 +1,
+    超过 limit 即返回 True(应拒)。Redis 不可用 → 返回 False(降级放行,不阻断真实用户)。
+    """
+    try:
+        import redis_bus
+        if redis_bus.get_sync_client() is None:
+            return False
+        cnt = redis_bus.rate_incr(f"{bucket}:{ip or '-'}", window_sec) or 0
+        return cnt > limit
+    except Exception:
+        return False
+
+
+def _record_login_fail(ip: str, username: str) -> int:
+    """记录一次失败。返回 username bucket 内累计失败次数。超阈值会被锁定。"""
+    # P2-5: 分别记录 per-IP 和 per-username bucket
+    ip_key = ip or "-"
+    # [round-3-P2] 用 normalize_username 做规范键(不只 .lower()):调用方虽多已先归一,
+    # 但内部统一规范可彻底消除「同一账号经不同表示得到不同限流桶」的绕过面(只会合并桶,不会放宽)。
+    user_key = normalize_username(username)
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        ip_cnt = redis_bus.rate_incr(f"loginfail:ip:{ip_key}", _IP_WINDOW_SEC) or 0
+        if ip_cnt >= _IP_MAX_FAILS:
+            redis_bus.lock_set(f"login:ip:{ip_key}", LOGIN_LOCKOUT_SEC)
+            redis_bus.rate_reset(f"loginfail:ip:{ip_key}")  # 锁定即清计数,避免锁到期后一击复锁
+        user_cnt = redis_bus.rate_incr(f"loginfail:user:{user_key}", _USER_WINDOW_SEC) or 0
+        if user_cnt >= _USER_MAX_FAILS:
+            redis_bus.lock_set(f"login:user:{user_key}", LOGIN_LOCKOUT_SEC)
+            # 关键:锁定后清空固定窗口计数器。否则计数 TTL(600s)≫ 锁定 TTL(60s),
+            # 锁到期后计数仍 ≥ 阈值,用户再失败 1 次就立即复锁,反复锁死 ~9 分钟。
+            # 清零后锁到期需重新累积满阈值才再锁,语义与进程内滑动窗口一致。
+            redis_bus.rate_reset(f"loginfail:user:{user_key}")
+        _write_audit(username, ip, "login_fail", {"count": user_cnt})
+        return user_cnt
+    now = time.monotonic()
+    with _FAIL_LOCK:
+        # per-IP bucket
+        ip_bucket = _FAIL_BUCKETS_IP.setdefault(ip_key, [])
+        ip_bucket.append(now)
+        ip_bucket[:] = [t for t in ip_bucket if now - t < _IP_WINDOW_SEC]
+        if len(ip_bucket) >= _IP_MAX_FAILS:
+            _LOCKED_UNTIL_IP[ip_key] = now + LOGIN_LOCKOUT_SEC
+        # per-username bucket
+        user_bucket = _FAIL_BUCKETS_USER.setdefault(user_key, [])
+        user_bucket.append(now)
+        user_bucket[:] = [t for t in user_bucket if now - t < _USER_WINDOW_SEC]
+        count = len(user_bucket)
+        if count >= _USER_MAX_FAILS:
+            _LOCKED_UNTIL_USER[user_key] = now + LOGIN_LOCKOUT_SEC
+    _write_audit(username, ip, "login_fail", {"count": count})
+    return count
+
+
+def _record_login_success(ip: str, username: str) -> None:
+    ip_key = ip or "-"
+    # [round-3-P2] 用 normalize_username 做规范键(不只 .lower()):调用方虽多已先归一,
+    # 但内部统一规范可彻底消除「同一账号经不同表示得到不同限流桶」的绕过面(只会合并桶,不会放宽)。
+    user_key = normalize_username(username)
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        for scope, k in (("ip", ip_key), ("user", user_key)):
+            redis_bus.rate_reset(f"loginfail:{scope}:{k}")
+            redis_bus.lock_clear(f"login:{scope}:{k}")
+        _write_audit(username, ip, "login_ok", {})
+        return
+    with _FAIL_LOCK:
+        _FAIL_BUCKETS_IP.pop(ip_key, None)
+        _LOCKED_UNTIL_IP.pop(ip_key, None)
+        _FAIL_BUCKETS_USER.pop(user_key, None)
+        _LOCKED_UNTIL_USER.pop(user_key, None)
+    _write_audit(username, ip, "login_ok", {})
+
+
+# [Fix-4] 仅首次调用时建表,后续跳过 CREATE TABLE IF NOT EXISTS 的锁开销
+_AUDIT_TABLE_READY = False
+
+
+def _write_audit(username: str, ip: str, event: str, meta: dict[str, Any]) -> None:
+    global _AUDIT_TABLE_READY
+    try:
+        init_db()
+        with connect() as db:
+            if not _AUDIT_TABLE_READY:
+                db.execute(
+                    """
+                    create table if not exists login_audit (
+                      id bigint generated by default as identity primary key,
+                      username text,
+                      ip text,
+                      event text not null,
+                      meta jsonb not null default '{}'::jsonb,
+                      created_at timestamptz not null default now()
+                    )
+                    """
+                )
+                _AUDIT_TABLE_READY = True
+            try:
+                db.execute(
+                    "insert into login_audit(username, ip, event, meta) values (%s, %s, %s, %s)",
+                    (username, ip, event, Jsonb(meta)),
+                )
+            except Exception:
+                import logging as _logging
+                _logging.getLogger(__name__).warning("audit insert failed", exc_info=True)
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("audit write failed", exc_info=True)
+
+
+def _mask_email(email: str) -> str:
+    email_norm = normalize_email(email)
+    if "@" not in email_norm:
+        return ""
+    local_part, domain_part = email_norm.split("@", 1)
+    return (local_part[:1] or "*") + "***@" + domain_part
+
+
+def admin_unlock(ip: str, username: str) -> None:
+    """admin 手动解锁某个用户/IP（暴露给 /api/admin/login/unlock 用）"""
+    ip_key = ip or "-"
+    # [round-3-P2] 用 normalize_username 做规范键(不只 .lower()):调用方虽多已先归一,
+    # 但内部统一规范可彻底消除「同一账号经不同表示得到不同限流桶」的绕过面(只会合并桶,不会放宽)。
+    user_key = normalize_username(username)
+    # Redis 模式:清共享锁定键 + 失败计数
+    try:
+        import redis_bus
+        if redis_bus.get_sync_client() is not None:
+            for scope, k in (("ip", ip_key), ("user", user_key)):
+                redis_bus.lock_clear(f"login:{scope}:{k}")
+                redis_bus.rate_reset(f"loginfail:{scope}:{k}")
+    except Exception:
+        pass
+    key = _bucket_key(ip, username)
+    with _FAIL_LOCK:
+        _FAIL_BUCKETS.pop(key, None)
+        _LOCKED_UNTIL.pop(key, None)
+        _LOCKED_UNTIL_IP.pop(ip_key, None)
+        _LOCKED_UNTIL_USER.pop(user_key, None)
+        _FAIL_BUCKETS_IP.pop(ip_key, None)
+        _FAIL_BUCKETS_USER.pop(user_key, None)
+    _write_audit(username, ip, "admin_unlock", {})
+
+
+def _bootstrap_admin_allowed(setup_token: str | None) -> bool:
+    """首用户(空 users 表)能否被授予 admin。
+
+    - 本地/非鉴权模式:允许(单用户桌面场景,无引导风险)。
+    - server/强制鉴权模式:必须配置 RPG_SETUP_TOKEN 且请求携带匹配令牌,
+      否则首用户仅为普通 user —— 杜绝公网首注册抢 admin(CWE-269)。
+    """
+    from core.config import effective_auth_required
+    from core.config import setup_token as _cfg_setup_token
+    if not effective_auth_required():
+        return True
+    configured = (_cfg_setup_token() or "").strip()
+    provided = (setup_token or "").strip()
+    if not configured or not provided:
+        return False
+    return secrets.compare_digest(provided, configured)
+
+
+def register(
+    username: str,
+    password: str,
+    display_name: str = "",
+    *,
+    email: str = "",
+    birthday=None,
+    invite_code: str | None = None,
+    terms_accepted: bool = False,
+    age_confirmed: bool = False,
+    setup_token: str | None = None,
+    ip: str = "",
+    ua: str = "",
+) -> dict[str, Any]:
+    """两步注册 Phase 1：写 email_verifications pending，发验证码，不创建 users 行。
+
+    Returns:
+        {"ok": True, "pending_verify": True, "email_mask": "u***@example.com"}
+    """
+    init_db()
+    username = normalize_username(username)
+    if not username:
+        raise ValueError("用户名不能为空")
+    if len(password or "") > 1024:
+        raise ValueError("密码超长")
+    if len(password or "") < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"密码至少 {MIN_PASSWORD_LENGTH} 位")
+
+    # ── REG-01: email 必填 ────────────────────────────────────────────────────
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("请填写有效的邮箱地址")
+
+    # ── AGE-01: 18+ 校验 ──────────────────────────────────────────────────────
+    if birthday is None:
+        raise ValueError("请提供出生日期")
+    from datetime import date as _date
+    if isinstance(birthday, str):
+        try:
+            birthday = _date.fromisoformat(birthday)
+        except ValueError as exc:
+            raise ValueError("出生日期格式错误，请使用 YYYY-MM-DD") from exc
+    if calc_age(birthday) < 18:
+        raise ValueError("你必须年满 18 周岁才能注册")
+
+    pending_payload = {
+        "username": username,
+        "password_hash": hash_password(password),
+        "display_name": (display_name or username).strip(),
+        "birthday": birthday.isoformat(),
+        "terms_accepted": terms_accepted,
+        "age_confirmed": age_confirmed,
+        # 由下方注册闸定:只有「仅邀请」模式下凭码进来的人才在 confirm 时原子消费这张码。
+        "invite_code": None,
+        "allow_admin": _bootstrap_admin_allowed(setup_token),
+        "ip": ip or "",
+        "ua": ua or "",
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+
+    with connect() as db:
+        # ── REG-04: 查 banned_users ───────────────────────────────────────────
+        banned = db.execute(
+            "select 1 from banned_users where email_norm = %s limit 1",
+            (email_norm,),
+        ).fetchone()
+        if banned:
+            raise ValueError("该邮箱已被限制注册")
+
+        # 检查 email 是否已被已验证用户占用
+        existing_email = db.execute(
+            "select 1 from users where lower(email) = %s and email_verified = true limit 1",
+            (email_norm,),
+        ).fetchone()
+        if existing_email:
+            raise ValueError("该邮箱已被注册")
+
+        # 检查 username 是否已占用
+        existing_user = db.execute(
+            "select 1 from users where username = %s limit 1",
+            (username,),
+        ).fetchone()
+        if existing_user:
+            raise ValueError("注册失败，请检查输入后重试")
+
+        # ── 注册闸(管理后台「注册与邀请」的注册模式)───────────────────────────
+        pending_payload["invite_code"] = _registration_gate(db, email_norm, invite_code)
+
+        # ── 注册风暴防护:成功路径也限流 ─────────────────────────────────────────
+        # _check_rate_limit/_record_login_fail 只在【失败】时计数,对「每次换新用户名+
+        # 新邮箱→每次都成功」的注册风暴无效 → 单 IP 可无限触发 SMTP 发件(Resend 计费)
+        # + email_verifications 表膨胀。这里对【成功路径】也加 per-email 冷却 + per-IP 预算。
+        # 仅 server 模式启用(本地无 Resend、单机无需);Redis 不可用时优雅降级。
+        from core.config import require_auth as _require_auth_reg0
+        if _require_auth_reg0():
+            try:
+                import redis_bus as _rb_reg
+                if _rb_reg.get_sync_client() is not None:
+                    rem = _rb_reg.lock_remaining(f"reg:email:{email_norm}")
+                    if rem and rem > 0:
+                        raise ValueError("请求过于频繁，请稍后再试")
+            except ValueError:
+                raise
+            except Exception:
+                pass
+            # per-IP:同 IP 注册(含成功)10 次/10min
+            if _ip_budget_exceeded("reg:ip", ip or "", 10, 600):
+                raise ValueError("请求过于频繁，请稍后再试")
+
+        # ── 写 email_verifications (pending) ──────────────────────────────────
+        code = generate_email_code(6)
+        code_h = hash_email_code(code)
+        expires_at = datetime.now(UTC) + timedelta(minutes=10)
+
+        # 失效同邮箱之前的未使用记录（防积累），再插入新记录
+        db.execute(
+            "update email_verifications set used_at = now() where lower(email) = %s and used_at is null and purpose = 'register'",
+            (email_norm,),
+        )
+        db.execute(
+            """
+            insert into email_verifications
+              (email, code_hash, purpose, expires_at, ip, ua)
+            values (%s, %s, 'register', %s, %s, %s)
+            """,
+            # SEC(H-7): ua 列存真实 user-agent,不再塞含 password_hash 的 pending_json。
+            (email_norm, code_h, expires_at, ip or "", (ua or "")[:512]),
+        )
+
+    _pending_store_set(email_norm, _encode_pending_register(pending_payload))
+
+    # ── 本地/自托管模式:跳过邮箱验证 ──────────────────────────────────────────
+    # 开源用户反馈:自托管没有 RESEND_API_KEY → 验证码发不出(Resend 403)→ 卡注册,
+    # 只能从后端日志扒验证码。邮箱验证只在 server 强制鉴权模式有意义(数据在云端);
+    # 本地部署数据保存在本地,直接用刚生成的 code 完成注册并登录,无需邮件。
+    from core.config import require_auth as _require_auth_reg
+    if not _require_auth_reg():
+        try:
+            user, token = confirm_email_verification(email_norm, code)
+            _log.info("[register] 本地模式自动完成注册(免邮箱验证) email=%s", _mask_email(email_norm))
+            return {
+                "ok": True, "pending_verify": False, "auto_verified": True,
+                "user": user, "session_token": token,
+                "email_mask": _mask_email(email_norm),
+            }
+        except Exception as _e:  # noqa: BLE001
+            _log.warning("[register] 本地模式自动验证失败,回退验证码流程: %s", _e)
+
+    # ── server 模式:发验证码邮件 ──────────────────────────────────────────────
+    from .email import EmailSendError, send_verification_email
+    try:
+        send_verification_email(email_norm, code)
+        # 发件成功 → 设 per-email 冷却(60s),阻断同邮箱快速重复注册刷件
+        try:
+            import redis_bus as _rb_reg2
+            if _rb_reg2.get_sync_client() is not None:
+                _rb_reg2.lock_set(f"reg:email:{email_norm}", 60)
+        except Exception:
+            pass
+    except EmailSendError:
+        _log.warning("send_verification_email failed (RESEND unconfigured?)")  # SEC(M-10): 不记明文验证码
+
+    return {"ok": True, "pending_verify": True, "email_mask": _mask_email(email_norm)}
+
+
+# 进程内 pending 注册缓存(回退用);跨 worker 走 Redis(见 _pending_store_*)
+_PENDING_REGISTER: dict[str, str] = {}
+_PENDING_TTL_SEC = 1800  # 待确认注册暂存有效期(覆盖 10 分钟验证码 + resend)
+
+
+def _pending_redis_key(email_norm: str) -> str:
+    return f"rpg:pending_reg:{email_norm}"
+
+
+def _pending_store_set(email_norm: str, pending_json: str) -> None:
+    """SEC(H-7): 跨 worker 暂存待确认注册(内含 Argon2 password_hash)。优先 Redis(有 TTL、
+    生产多 worker 共享),回退进程内 dict。**不再写入 email_verifications.ua**——那是 DB 明文
+    哈希暴露面(DB 读权限即可离线爆破未完成注册的密码)。"""
+    _PENDING_REGISTER[email_norm] = pending_json
+    try:
+        import redis_bus
+        c = redis_bus.get_sync_client()
+        if c is not None:
+            c.setex(_pending_redis_key(email_norm), _PENDING_TTL_SEC, pending_json)
+    except Exception:
+        pass
+
+
+def _pending_store_get(email_norm: str, *, consume: bool = False) -> str | None:
+    val = _PENDING_REGISTER.get(email_norm)
+    if val is None:
+        try:
+            import redis_bus
+            c = redis_bus.get_sync_client()
+            if c is not None:
+                raw = c.get(_pending_redis_key(email_norm))
+                if raw is not None:
+                    val = raw.decode() if isinstance(raw, (bytes, bytearray)) else str(raw)
+        except Exception:
+            val = None
+    if consume:
+        _PENDING_REGISTER.pop(email_norm, None)
+        try:
+            import redis_bus
+            c = redis_bus.get_sync_client()
+            if c is not None:
+                c.delete(_pending_redis_key(email_norm))
+        except Exception:
+            pass
+    return val
+
+
+def _encode_pending_register(payload: dict[str, Any]) -> str:
+    import json as _json
+    return _PENDING_REGISTER_UA_PREFIX + _json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _decode_pending_register(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    import json as _json
+    text = str(raw)
+    if text.startswith(_PENDING_REGISTER_UA_PREFIX):
+        text = text[len(_PENDING_REGISTER_UA_PREFIX):]
+    try:
+        payload = _json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not payload.get("username") or not payload.get("password_hash") or not payload.get("birthday"):
+        return None
+    return payload
+
+
+def _row_get(row, key: str, default=None):
+    try:
+        return row[key]
+    except Exception:
+        try:
+            return row.get(key, default)
+        except Exception:
+            return default
+
+
+# 注册模式全集。前三个是管理后台能切的;"allowlist" 是早期 SQL 手设的别名(只认白名单,不收邀请码)。
+REGISTRATION_MODES = ("open", "invite", "closed", "allowlist")
+_ALLOWLIST_REJECT_MSG = "该邮箱不在内测白名单。本批次仅向早期预约者开放,如需加入下一批请到 play.stellatrix.icu 留邮箱。"
+_REGISTRATION_CLOSED_MSG = "当前已关闭注册，暂不接受新账号"
+
+
+def registration_mode(db) -> str:
+    """注册模式的单一读方(密码注册 / Apple 新建账号 / 登录页 schema 共用)。
+
+    app_config.value 是 jsonb,psycopg 读出来已经是 dict;老数据或测试桩可能是 JSON 串,
+    两种形状都认。旧实现对 dict 调 json.loads 抛错被吞 → 恒判 open,「仅邀请」形同虚设。
+    行不存在 / 值坏掉 / mode 为空 → open(与历史行为一致)。
+    """
+    try:
+        row = db.execute(
+            "select value from app_config where key = 'admin.registration_config' limit 1"
+        ).fetchone()
+    except Exception:
+        return "open"
+    raw = _row_get(row, "value") if row else None
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        import json as _json
+        try:
+            raw = _json.loads(raw)
+        except Exception:
+            return "open"
+    if not isinstance(raw, dict):
+        return "open"
+    return str(raw.get("mode") or "").strip().lower() or "open"
+
+
+def invite_code_unused_sql(alias: str = "") -> str:
+    """邀请码「没用过」的唯一判据(SQL 片段),注册闸、confirm 原子预占、管理页列表 / 删除共用。
+
+    invite_codes.used_by 的外键是 on delete set null:用这张码注册的账号被硬删后,used_by 变回
+    NULL,used_at 仍在。只看 used_by is null 会把用过的码当成没用过,单次码能再注册一次;
+    管理页按 used_at 显示「已使用」。两列都空才算没用过,两边口径一致。
+    """
+    p = f"{alias}." if alias else ""
+    return f"({p}used_by is null and {p}used_at is null)"
+
+
+def _assert_new_accounts_open(db) -> str:
+    """所有「新建账号」路径共用的第一道闸:关闭注册一律拒。放行时返回当前注册模式。
+
+    密码注册(_registration_gate)、Apple 新建账号(_assert_registration_allowed)、魔法链接
+    (login_via_magic_token)、免密验证码(verify_passwordless_and_login)都先过这里,拒绝矩阵
+    只有一份。已有账号的登录不经过这里,不受注册模式影响。
+    """
+    mode = registration_mode(db)
+    if mode == "closed":
+        raise ValueError(_REGISTRATION_CLOSED_MSG)
+    return mode
+
+
+def _email_allowlisted(db, email_norm: str) -> bool:
+    if not email_norm:
+        return False
+    return db.execute(
+        "select 1 from registration_allowlist where email_norm = %s",
+        (email_norm,),
+    ).fetchone() is not None
+
+
+def _registration_gate(db, email_norm: str, invite_code: str | None) -> str | None:
+    """密码注册的准入判定。放行时返回 confirm 阶段要原子消费的邀请码(None = 不消费)。
+
+    - open:放行;填了邀请码也忽略(移动端表单是选填框,笔误不该让 confirm 抢码失败回滚整个注册)。
+    - closed:一律拒。
+    - allowlist(SQL 别名):只认内测白名单。
+    - invite:内测白名单邮箱直接放行(06-01 定下的「仅邀请」语义);否则必须带有效、未用、
+      未过期的邀请码。码在 confirm 时原子预占,并发双花由那边的 rowcount 判定兜住。
+    """
+    mode = _assert_new_accounts_open(db)
+    if mode not in ("invite", "allowlist"):
+        return None
+    if _email_allowlisted(db, email_norm):
+        return None
+    if mode == "allowlist":
+        raise ValueError(_ALLOWLIST_REJECT_MSG)
+    code = (invite_code or "").strip()
+    if not code:
+        raise ValueError("当前为邀请制，注册需要填写邀请码（已预约内测的邮箱不用填）")
+    row = db.execute(
+        f"""
+        select 1 from invite_codes
+        where code = %s
+          and {invite_code_unused_sql()}
+          and (expires_at is null or expires_at > now())
+        limit 1
+        """,
+        (code,),
+    ).fetchone()
+    if not row:
+        raise ValueError("邀请码无效或已使用")
+    return code
+
+
+def _verify_locked(email_norm: str) -> bool:
+    """该 email 是否因验证码尝试过多被锁。Redis 主路径,失败回落进程内。"""
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        return (redis_bus.lock_remaining(f"verify:{email_norm}") or 0) > 0
+    now = time.monotonic()
+    with _FAIL_LOCK:
+        return _VERIFY_LOCKED_UNTIL.get(email_norm, 0) > now
+
+
+def _record_verify_fail(email_norm: str) -> None:
+    """记录一次验证码失败;达上限则锁定该 email 一个窗口。"""
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        cnt = redis_bus.rate_incr(f"verifyfail:{email_norm}", _VERIFY_WINDOW_SEC) or 0
+        if cnt >= _VERIFY_MAX_FAILS:
+            redis_bus.lock_set(f"verify:{email_norm}", _VERIFY_WINDOW_SEC)
+            redis_bus.rate_reset(f"verifyfail:{email_norm}")  # 锁定即清计数,避免锁到期一击复锁
+        return
+    now = time.monotonic()
+    with _FAIL_LOCK:
+        bucket = _VERIFY_FAIL_BUCKETS.setdefault(email_norm, [])
+        bucket.append(now)
+        bucket[:] = [t for t in bucket if now - t < _VERIFY_WINDOW_SEC]
+        if len(bucket) >= _VERIFY_MAX_FAILS:
+            _VERIFY_LOCKED_UNTIL[email_norm] = now + _VERIFY_WINDOW_SEC
+
+
+def _clear_verify_fail(email_norm: str) -> None:
+    """验证成功后清计数 + 解锁。"""
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        redis_bus.rate_reset(f"verifyfail:{email_norm}")
+        redis_bus.lock_clear(f"verify:{email_norm}")
+        return
+    with _FAIL_LOCK:
+        _VERIFY_FAIL_BUCKETS.pop(email_norm, None)
+        _VERIFY_LOCKED_UNTIL.pop(email_norm, None)
+
+
+def confirm_email_verification(email: str, code: str) -> tuple[dict[str, Any], str]:
+    """两步注册 Phase 2：验证 code → 创建 users 行 → 颁 session token。
+
+    Returns:
+        (user_dict, session_token)
+    """
+    email_norm = normalize_email(email)
+    init_db()
+
+    # 暴破防护:同 email 验证码尝试过多则锁定一个窗口(防 6 位码被穷举)
+    if _verify_locked(email_norm):
+        raise ValueError("验证尝试次数过多，请稍后重新获取验证码")
+
+    with connect() as db:
+        # 查有效 verif 记录
+        verif = db.execute(
+            """
+            select * from email_verifications
+            where lower(email) = %s
+              and purpose = 'register'
+              and used_at is null
+              and expires_at > now()
+            order by created_at desc
+            limit 1
+            """,
+            (email_norm,),
+        ).fetchone()
+        if not verif:
+            raise ValueError("验证码已过期或不存在，请重新注册")
+
+        if not verify_email_code(code, verif["code_hash"]):
+            _record_verify_fail(email_norm)  # 计失败,达上限锁定该 email 一个窗口(防暴破)
+            raise ValueError("验证码错误")
+        _clear_verify_fail(email_norm)  # 验证通过,清失败计数 + 解锁
+
+        # 取 pending 注册参数。优先读进程缓存；若部署重启导致缓存丢失，
+        # 从 email_verifications.ua 中恢复，保证验证码窗口内仍可完成注册。
+        # SEC(H-7): 从 Redis/进程内取 pending(不再从 ua 列恢复 password_hash)。
+        pending_json = _pending_store_get(email_norm, consume=True)
+        pending = _decode_pending_register(pending_json)
+        if not pending:
+            raise ValueError("注册会话已过期，请重新注册")
+
+        allow_admin = (
+            bool(pending.get("allow_admin"))
+            if "allow_admin" in pending
+            else _bootstrap_admin_allowed(pending.get("setup_token"))
+        )
+
+        from datetime import date as _date
+        birthday = _date.fromisoformat(pending["birthday"])
+
+        try:
+            if allow_admin:
+                row = db.execute(
+                    """
+                    insert into users(
+                      username, password_hash, display_name, role,
+                      email, email_verified, email_verified_at,
+                      birthday, terms_accepted_at, age_confirmed
+                    )
+                    values (
+                      %s, %s, %s,
+                      CASE WHEN NOT EXISTS (SELECT 1 FROM users WHERE role = 'admin')
+                           THEN 'admin' ELSE 'user' END,
+                      %s, true, now(), %s,
+                      CASE WHEN %s THEN now() ELSE null END, %s
+                    )
+                    returning *
+                    """,
+                    (
+                        pending["username"], pending["password_hash"], pending["display_name"],
+                        email_norm, birthday,
+                        pending.get("terms_accepted", False),
+                        pending.get("age_confirmed", False),
+                    ),
+                ).fetchone()
+            else:
+                row = db.execute(
+                    """
+                    insert into users(
+                      username, password_hash, display_name, role,
+                      email, email_verified, email_verified_at,
+                      birthday, terms_accepted_at, age_confirmed
+                    )
+                    values (%s, %s, %s, 'user', %s, true, now(), %s,
+                            CASE WHEN %s THEN now() ELSE null END, %s)
+                    returning *
+                    """,
+                    (
+                        pending["username"], pending["password_hash"], pending["display_name"],
+                        email_norm, birthday,
+                        pending.get("terms_accepted", False),
+                        pending.get("age_confirmed", False),
+                    ),
+                ).fetchone()
+        except UniqueViolation as exc:
+            raise ValueError("注册失败，请检查输入后重试") from exc
+
+        user = dict(row)
+
+        # 标记 invite_code 已用。原子预占:用 rowcount 判定是否抢到。
+        # 原写法不查 rowcount,两个请求拿同一单次邀请码并发 confirm 时,user 行已先 INSERT,
+        # 第二个的 UPDATE 命中 0 行被忽略却照样建号 → 单次邀请码双花、邀请 gate 被绕过。
+        # 命中 0 行即抛错回滚整个事务(同一 with connect(),user INSERT 一并回滚)。
+        invite_code = pending.get("invite_code")
+        if invite_code:
+            _res = db.execute(
+                "update invite_codes set used_by = %s, used_at = now() "
+                f"where code = %s and {invite_code_unused_sql()}",
+                (user["id"], invite_code),
+            )
+            if _res.rowcount == 0:
+                raise ValueError("邀请码已被使用，请联系邀请人获取新的邀请码")
+
+        # 标记验证码已使用。放在用户创建之后，避免 pending 恢复失败时吞掉有效验证码。
+        db.execute(
+            "update email_verifications set used_at = now() where id = %s",
+            (verif["id"],),
+        )
+
+        # 颁 session — [round-4-P2] 走 _issue_session(强制 20 会话/用户上限,逐出最旧),
+        #   与 login/confirm_login_code/passwordless/magic 各登录路径一致;原裸 INSERT 绕过上限,
+        #   反复「换用户名同邮箱重注册」可无限堆积会话。
+        token = _issue_session(db, user["id"])
+
+    return user, token
+
+
+def _hash_token(token: str) -> str:
+    """session token → sha256 hex(DB 只存哈希,不存明文)。
+
+    委托 core.security.hash_token(token 哈希单一真相源)。函数内惰性 import:
+    core.security 顶层 re-export 本模块,直接顶层 import 会成加载期循环。
+    """
+    from core.security import hash_token
+    return hash_token(token)
+
+
+def _issue_session(db, user_id: int) -> str:
+    active_count = db.execute(
+        "select count(*) as n from sessions where user_id = %s and expires_at > now()",
+        (user_id,),
+    ).fetchone()["n"]
+    if active_count >= 20:
+        db.execute(
+            """
+            delete from sessions where id in (
+              select id from sessions
+              where user_id = %s and expires_at > now()
+              order by created_at asc
+              limit %s
+            )
+            """,
+            (user_id, int(active_count) - 19),
+        )
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(days=SESSION_DAYS)
+    db.execute(
+        "insert into sessions(token, token_hash, user_id, expires_at) values (%s, %s, %s, %s)",
+        ("", _hash_token(token), user_id, expires_at),
+    )
+    return token
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sign in with Apple(原生 iOS/iPadOS)
+#   客户端拿到 Apple 签名的 identity_token(JWT/RS256)→ 本端用 Apple 公钥(JWKS)校验
+#   签名 + iss/aud/exp + nonce → 取 sub(稳定用户标识)+ email → 查/建账号 → 发 session。
+#   JWKS URL 是 Apple 固定常量(非用户可控)→ 直连安全,无 SSRF 风险。
+# ──────────────────────────────────────────────────────────────────────────────
+APPLE_ISSUER = "https://appleid.apple.com"
+APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+# 原生 App 的 audience = iOS bundle id;可经环境覆盖(改包名 / 加 Services ID)。
+APPLE_AUDIENCE = os.environ.get("APPLE_BUNDLE_ID", "icu.stellatrix.chat")
+
+_apple_jwk_client = None
+_apple_jwk_lock = threading.Lock()
+
+
+def _get_apple_jwk_client():
+    global _apple_jwk_client
+    if _apple_jwk_client is None:
+        with _apple_jwk_lock:
+            if _apple_jwk_client is None:
+                from jwt import PyJWKClient
+                _apple_jwk_client = PyJWKClient(APPLE_JWKS_URL, cache_keys=True, lifespan=3600)
+    return _apple_jwk_client
+
+
+def verify_apple_identity_token(identity_token: str, raw_nonce: str = "") -> dict[str, Any]:
+    """校验 Apple identity_token,成功返回 {sub, email, email_verified};任何不合法都抛 ValueError。"""
+    import jwt
+
+    token = (identity_token or "").strip()
+    if not token:
+        raise ValueError("缺 identity_token")
+    try:
+        signing_key = _get_apple_jwk_client().get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],          # 只接受 Apple 的 RS256,杜绝 alg=none / HS 混淆
+            audience=APPLE_AUDIENCE,
+            issuer=APPLE_ISSUER,
+            options={"require": ["exp", "iat", "iss", "aud", "sub"]},
+        )
+    except Exception:
+        raise ValueError("Apple 身份令牌校验失败")
+    if raw_nonce:
+        expected = hashlib.sha256(raw_nonce.encode("utf-8")).hexdigest()
+        if not secrets.compare_digest(str(claims.get("nonce") or ""), expected):
+            raise ValueError("nonce 不匹配,登录被拒绝")
+    sub = str(claims.get("sub") or "").strip()
+    if not sub:
+        raise ValueError("Apple 令牌缺 sub")
+    email = str(claims.get("email") or "").strip().lower()
+    return {"sub": sub, "email": email, "email_verified": claims.get("email_verified") in (True, "true", "1")}
+
+
+def _assert_registration_allowed(db, email_norm: str) -> None:
+    """Apple 新建账号的准入:关闭注册一律拒;allowlist/invite 下邮箱必须在白名单
+    (Apple 登录没有邀请码输入);open/dev 不拦。模式读取与密码注册同源(registration_mode)。"""
+    mode = _assert_new_accounts_open(db)
+    if mode in ("allowlist", "invite") and not _email_allowlisted(db, email_norm):
+        raise ValueError("该邮箱不在内测白名单。本批次仅向早期预约者开放。")
+
+
+def _apple_unique_username(db, email_norm: str, apple_sub: str) -> str:
+    base = normalize_username((email_norm.split("@")[0] if email_norm else "") or ("apple_" + apple_sub[:8])) or "apple_user"
+    uname = base
+    for i in range(2, 80):
+        if not db.execute("select 1 from users where username = %s", (uname,)).fetchone():
+            return uname
+        uname = f"{base}{i}"
+    return f"{base}_{secrets.token_hex(3)}"
+
+
+def login_or_create_apple_user(apple_sub: str, email: str = "", name: str = "") -> tuple[dict[str, Any], str]:
+    """按 Apple sub 查/建账号并发 session。返回 (user, session_token)。"""
+    apple_sub = (apple_sub or "").strip()
+    if not apple_sub:
+        raise ValueError("缺 apple_sub")
+    email_norm = (email or "").strip().lower()
+    with connect() as db:
+        row = db.execute("select * from users where apple_sub = %s", (apple_sub,)).fetchone()
+        if row:
+            user = dict(row)
+            # Apple 仅首次回带 email → 已有账号但缺邮箱时回填
+            if email_norm and not str(user.get("email") or "").strip():
+                db.execute("update users set email = %s, email_verified = true where id = %s", (email_norm, user["id"]))
+                user["email"] = email_norm
+        else:
+            row = db.execute(
+                "select * from users where lower(email) = %s order by id asc limit 1", (email_norm,)
+            ).fetchone() if email_norm else None
+            if row:
+                # 同邮箱已有账号 → 关联 Apple(已有邮箱用户也能改用 Apple 登录)
+                user = dict(row)
+                db.execute("update users set apple_sub = %s where id = %s", (apple_sub, user["id"]))
+                user["apple_sub"] = apple_sub
+            else:
+                _assert_registration_allowed(db, email_norm)
+                disp = (name or "").strip() or (email_norm.split("@")[0] if email_norm else "Apple 用户")
+                uname = _apple_unique_username(db, email_norm, apple_sub)
+                user = dict(db.execute(
+                    """
+                    insert into users(username, password_hash, display_name, role, email,
+                                      email_verified, age_confirmed, terms_accepted_at, apple_sub)
+                    values (%s, null, %s, 'user', %s, %s, true, now(), %s)
+                    returning *
+                    """,
+                    (uname, disp, email_norm, bool(email_norm), apple_sub),
+                ).fetchone())
+        token = _issue_session(db, user["id"])
+        return user, token
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 桌面/本地部署:默认账户 + 账户管理 + 一次性「免登录魔法链接」
+# ──────────────────────────────────────────────────────────────────────────────
+DESKTOP_LOGIN_TTL_MIN = 10  # 魔法链接有效期(分钟),单次使用
+
+
+def local_account() -> dict[str, Any] | None:
+    """本地默认账户 = 库中第一个用户(按 id)。无则 None。"""
+    with connect() as db:
+        row = db.execute("select * from users order by id asc limit 1").fetchone()
+        return dict(row) if row else None
+
+
+def bootstrap_local_account(username: str = "local", display_name: str = "本地用户") -> dict[str, Any]:
+    """本地/桌面模式首启:若库中没有任何用户,创建一个默认账户(role=admin,无密码 → 回环免登录)。
+    幂等:已有用户则原样返回第一个。改用户名/密码不换 id,数据始终归同一账户。"""
+    existing = local_account()
+    if existing:
+        return existing
+    init_db()
+    with connect() as db:
+        # 再查一次(并发/多 worker 防重),无则插入。
+        row = db.execute("select * from users order by id asc limit 1").fetchone()
+        if row:
+            return dict(row)
+        uname = normalize_username(username) or "local"
+        row = db.execute(
+            """
+            insert into users(username, password_hash, display_name, role,
+                              email, email_verified, age_confirmed, terms_accepted_at)
+            values (%s, null, %s, 'admin', '', false, true, now())
+            returning *
+            """,
+            (uname, (display_name or uname)),
+        ).fetchone()
+        return dict(row)
+
+
+def local_account_has_password() -> bool:
+    """默认账户是否已设密码(设了则回环也要求真实会话 / LAN 必须登录)。"""
+    acct = local_account()
+    return bool(acct and acct.get("password_hash"))
+
+
+def update_local_account(user_id: int, *, username: str | None = None,
+                         display_name: str | None = None) -> dict[str, Any]:
+    """改本地账户用户名/昵称(不换 id)。用户名唯一冲突 → ValueError。"""
+    sets, args = [], []
+    if username is not None:
+        uname = normalize_username(username)
+        if not uname:
+            raise ValueError("用户名不能为空")
+        sets.append("username = %s")
+        args.append(uname)
+    if display_name is not None:
+        sets.append("display_name = %s")
+        args.append(display_name.strip() or "本地用户")
+    if not sets:
+        raise ValueError("无可更新字段")
+    sets.append("updated_at = now()")
+    args.append(int(user_id))
+    with connect() as db:
+        try:
+            row = db.execute(
+                f"update users set {', '.join(sets)} where id = %s returning *",
+                tuple(args),
+            ).fetchone()
+        except UniqueViolation as exc:
+            raise ValueError("该用户名已被占用") from exc
+    if not row:
+        raise ValueError("账户不存在")
+    return dict(row)
+
+
+def set_account_password(user_id: int, password: str) -> None:
+    """设/改/清除本地账户密码。空字符串 = 清除(回到回环免登录)。
+    不撤销现有 session(避免把正打开的浏览器/控制台踢掉)。"""
+    pw = password or ""
+    pw_hash = hash_password(pw) if pw else None
+    with connect() as db:
+        db.execute(
+            "update users set password_hash = %s, updated_at = now() where id = %s",
+            (pw_hash, int(user_id)),
+        )
+
+
+def create_desktop_login_token(user_id: int) -> str:
+    """铸一次性桌面登录 token(控制台主进程在回环内调用)。返回明文,DB 只存哈希。"""
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(UTC) + timedelta(minutes=DESKTOP_LOGIN_TTL_MIN)
+    with connect() as db:
+        # 允许同账户多枚有效 token 并存:自部署常把「登录链接」+「二维码」分别发给不同设备
+        # (手机/平板),各自单次消费。每枚仍单次 + 10 分钟 TTL,过期自然失效,无需互相作废。
+        db.execute(
+            "insert into desktop_login_tokens(token_hash, user_id, expires_at) values (%s, %s, %s)",
+            (_hash_token(token), int(user_id), expires_at),
+        )
+    return token
+
+
+def consume_desktop_login_token(token: str) -> tuple[dict[str, Any], str]:
+    """兑换桌面登录 token → (user, session_token)。单次使用 + TTL 校验。失败 → ValueError。"""
+    if not token:
+        raise ValueError("缺 token")
+    init_db()
+    with connect() as db:
+        # 原子认领:UPDATE ... WHERE used_at IS NULL RETURNING —— 行锁让第一个写者赢,
+        # 并发的第二次 consume 命中 0 行(used_at 已非空)→ 真·单次使用,杜绝 TOCTOU 双发会话。
+        claimed = db.execute(
+            "update desktop_login_tokens set used_at = now() "
+            "where token_hash = %s and used_at is null and expires_at > now() "
+            "returning user_id",
+            (_hash_token(token),),
+        ).fetchone()
+        if not claimed:
+            raise ValueError("链接无效或已过期")
+        user = db.execute(
+            "select * from users where id = %s and deactivated_at is null",
+            (claimed["user_id"],),
+        ).fetchone()
+        if not user:
+            raise ValueError("账户不存在")
+        session_token = _issue_session(db, int(user["id"]))
+    return dict(user), session_token
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 自部署「邀请链接」:控制台铸可复用邀请 token,局域网内的人开 /Login.html?invite= 轻量注册
+# (用户名+密码,无邮箱/验证码 —— 自部署没 SMTP,朋友也不必给邮箱;host 对自己 LAN 负责)。
+# ──────────────────────────────────────────────────────────────────────────────
+DESKTOP_INVITE_TTL_HOURS = 24 * 14  # 邀请链接默认 14 天有效、可复用(撤销/过期失效)
+
+
+def create_desktop_invite_token(creator_id: int) -> str:
+    """铸一枚可复用邀请 token(控制台回环调用)。返回明文,DB 只存哈希。"""
+    token = secrets.token_urlsafe(24)
+    expires_at = datetime.now(UTC) + timedelta(hours=DESKTOP_INVITE_TTL_HOURS)
+    init_db()
+    with connect() as db:
+        db.execute(
+            "insert into desktop_invite_tokens(token_hash, created_by, expires_at) values (%s, %s, %s)",
+            (_hash_token(token), int(creator_id), expires_at),
+        )
+    return token
+
+
+def validate_desktop_invite_token(token: str) -> bool:
+    """邀请 token 是否有效(存在 + 未撤销 + 未过期)。"""
+    if not token:
+        return False
+    init_db()
+    with connect() as db:
+        row = db.execute(
+            "select 1 from desktop_invite_tokens "
+            "where token_hash = %s and revoked_at is null and expires_at > now()",
+            (_hash_token(token),),
+        ).fetchone()
+    return bool(row)
+
+
+def revoke_desktop_invite_tokens() -> None:
+    """撤销全部未撤销邀请 token(停止邀请)。"""
+    init_db()
+    with connect() as db:
+        db.execute("update desktop_invite_tokens set revoked_at = now() where revoked_at is null")
+
+
+def register_via_invite(
+    invite_token: str,
+    username: str,
+    password: str,
+    *,
+    display_name: str = "",
+    age_confirmed: bool = False,
+) -> tuple[dict[str, Any], str]:
+    """凭邀请 token 轻量注册一个普通用户(role=user,无邮箱)→ (user, session_token)。
+    单写者建号 + 即时发会话(注册即登录)。用户名唯一冲突 / 弱密码 / 无效邀请 → ValueError。"""
+    if not validate_desktop_invite_token(invite_token):
+        raise ValueError("邀请链接无效或已过期")
+    if not age_confirmed:
+        raise ValueError("请确认你已年满 18 岁")
+    username = normalize_username(username)
+    if not username:
+        raise ValueError("用户名不能为空")
+    if len(password or "") < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"密码至少 {MIN_PASSWORD_LENGTH} 位")
+    if len(password or "") > 1024:
+        raise ValueError("密码超长")
+    init_db()
+    pw_hash = hash_password(password)
+    with connect() as db:
+        try:
+            row = db.execute(
+                "insert into users(username, password_hash, display_name, role, "
+                "email, email_verified, age_confirmed, terms_accepted_at) "
+                "values (%s, %s, %s, 'user', '', false, true, now()) returning *",
+                (username, pw_hash, (display_name or "").strip() or username),
+            ).fetchone()
+        except UniqueViolation as exc:
+            raise ValueError("该用户名已被占用") from exc
+        session_token = _issue_session(db, int(row["id"]))
+    return dict(row), session_token
+
+
+def request_login_code(email: str, *, ip: str = "", ua: str = "") -> dict[str, Any]:
+    """Send a one-time email code for passwordless login.
+
+    返回里的 `registered` 告诉调用方这个邮箱有没有账号 —— 没有就该把人领去注册,
+    而不是让他对着「验证码已发送」干等一封永远不会到的信(群反馈 08-01)。
+
+    为什么敢直说(这里原本刻意静默 ok 防账号枚举):**那个防护是装饰性的**。
+    同一套 API 的 `register` 对已占用邮箱直接回「该邮箱已被注册」,枚举面本来就
+    敞开着 —— 于是登录码这边的沉默一个攻击者都挡不住,只挡住了真实用户。
+    要真防枚举必须两边一起改(注册也不许透露邮箱是否被占用,改用「验证码已发到该
+    邮箱」的统一话术),那是独立的一件事;在两边对齐之前,这里不该单方面牺牲可用性。
+
+    per-IP 发码预算超限仍走静默 ok —— 那条是**防滥发**,不是防枚举,语义不同。
+    """
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("请填写有效的邮箱地址")
+    _check_rate_limit(ip, email_norm)
+    # per-IP 发码预算:防单 IP 向任意已注册邮箱批量发登录码。静默返回 ok(防滥发)。
+    # 这条**故意不报 registered** —— 到这一步已是滥用嫌疑,不给它任何探测信号。
+    if _ip_budget_exceeded("logincode:ip", ip, 20, 600):
+        return {"ok": True, "pending_verify": True, "email_mask": _mask_email(email_norm)}
+
+    init_db()
+    user_id: int | None = None
+    with connect() as db:
+        row = db.execute(
+            """
+            select id from users
+            where lower(email) = %s
+              and email_verified = true
+              and deactivated_at is null
+            limit 1
+            """,
+            (email_norm,),
+        ).fetchone()
+        if not row:
+            # 该邮箱没有可登录的账号 → 明确告知,由客户端领去注册流程。
+            # 旧行为是返回 pending_verify=True 假装发了信,于是用户对着验证码输入框
+            # 等一封永远不会到的邮件(群反馈 08-01:「查了半天他没注册,就没发登录邮件」)。
+            return {"ok": True, "registered": False, "email_mask": _mask_email(email_norm)}
+
+        recent = db.execute(
+            """
+            select created_at from email_verifications
+            where lower(email) = %s
+              and purpose = 'login'
+              and used_at is null
+            order by created_at desc
+            limit 1
+            """,
+            (email_norm,),
+        ).fetchone()
+        if recent:
+            created = recent["created_at"]
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            elapsed = (datetime.now(UTC) - created).total_seconds()
+            if elapsed < 60:
+                raise ValueError(f"发送太频繁，请 {int(60 - elapsed) + 1} 秒后再试")
+
+        user_id = int(row["id"])
+        code = generate_email_code(6)
+        code_h = hash_email_code(code)
+        expires_at = datetime.now(UTC) + timedelta(minutes=10)
+        db.execute(
+            "update email_verifications set used_at = now() "
+            "where lower(email) = %s and purpose = 'login' and used_at is null",
+            (email_norm,),
+        )
+        db.execute(
+            """
+            insert into email_verifications
+              (email, code_hash, user_id, purpose, expires_at, ip, ua)
+            values (%s, %s, %s, 'login', %s, %s, %s)
+            """,
+            (email_norm, code_h, user_id, expires_at, ip or "", ua or ""),
+        )
+
+    from .email import EmailSendError, send_login_code_email
+    try:
+        send_login_code_email(email_norm, code)
+    except EmailSendError:
+        _log.warning("send_login_code_email failed (RESEND unconfigured?)")  # SEC(M-10): 不记明文验证码
+
+    return {"ok": True, "registered": True, "pending_verify": True,
+            "email_mask": _mask_email(email_norm)}
+
+
+def confirm_login_code(email: str, code: str, *, ip: str = "") -> tuple[dict[str, Any], str]:
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("请填写有效的邮箱地址")
+    code = (code or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        raise ValueError("请输入 6 位数字验证码")
+    # [Fix-2] 镜像 confirm_email_verification 的 per-email 验证码暴破防护
+    if _verify_locked(email_norm):
+        raise ValueError("验证尝试次数过多，请稍后重新获取验证码")
+    _check_rate_limit(ip, email_norm)
+
+    init_db()
+    with connect() as db:
+        # Step 1: 取最新未消费记录（仅用于 hash 比对，尚未消费）
+        verif = db.execute(
+            """
+            select id, code_hash, user_id from email_verifications
+            where lower(email) = %s
+              and purpose = 'login'
+              and used_at is null
+              and expires_at > now()
+            order by created_at desc
+            limit 1
+            """,
+            (email_norm,),
+        ).fetchone()
+        if not verif or not verify_email_code(code, verif["code_hash"]):
+            # 错码或无记录：不消费，只计失败
+            _record_verify_fail(email_norm)  # [Fix-2] per-email 验证码失败计数(达上限锁定该 email)
+            _record_login_fail(ip, email_norm)
+            raise ValueError("验证码错误或已过期")
+
+        # Step 2: 原子消费 — WHERE 里重检 used_at IS NULL，并发第二个请求命中 0 行
+        # SEC: hash 已在 Step 1 比对通过才到这里，此处只做 CAS 式消费。
+        consumed = db.execute(
+            "UPDATE email_verifications SET used_at = NOW() "
+            "WHERE id = %s AND used_at IS NULL "
+            "RETURNING id",
+            (verif["id"],),
+        ).fetchone()
+        if not consumed:
+            # 并发重放：第一个请求已消费
+            _record_login_fail(ip, email_norm)
+            raise ValueError("验证码错误或已过期")
+
+        row = db.execute(
+            """
+            select * from users
+            where id = %s
+              and lower(email) = %s
+              and email_verified = true
+              and deactivated_at is null
+            limit 1
+            """,
+            (verif["user_id"], email_norm),
+        ).fetchone()
+        if not row:
+            _record_login_fail(ip, email_norm)
+            raise ValueError("验证码错误或已过期")
+
+        token = _issue_session(db, int(row["id"]))
+        _record_login_success(ip, email_norm)
+        return dict(row), token
+
+
+def login(username: str, password: str, *, ip: str = "") -> tuple[dict[str, Any], str]:
+    """登录，带速率限制 + 失败审计 + email 登录支持 + Argon2id rehash。"""
+    if len(password or "") > 1024:
+        raise ValueError("密码超长")
+    init_db()
+    normalized = normalize_username(username)
+    _check_rate_limit(ip, normalized)  # 锁定中直接抛 RateLimited
+    with connect() as db:
+        # 先尝试 username，再尝试 email（REG-01：支持邮箱登录）
+        row = db.execute(
+            "select * from users where username = %s and deactivated_at is null",
+            (normalized,),
+        ).fetchone()
+        if not row:
+            # 尝试邮箱登录（仅已验证邮箱）
+            email_norm = normalize_email(username)
+            row = db.execute(
+                "select * from users where lower(email) = %s and email_verified = true and deactivated_at is null limit 1",
+                (email_norm,),
+            ).fetchone()
+
+        if not row:
+            _record_login_fail(ip, normalized)
+            raise ValueError("用户名或密码错误")
+
+        ok, needs_rehash = verify_password_with_rehash(row["password_hash"], password)
+        if not ok:
+            _record_login_fail(ip, normalized)
+            raise ValueError("用户名或密码错误")
+
+        # ENC-08: 老 PBKDF2 账号登录成功后升级为 Argon2id
+        if needs_rehash:
+            new_hash = hash_password(password)
+            db.execute(
+                "update users set password_hash = %s where id = %s",
+                (new_hash, row["id"]),
+            )
+            _log.info("rehashed password to argon2id for user_id=%s", row["id"])
+
+        token = secrets.token_urlsafe(32)
+        # 使用 timezone-aware UTC 时间, 避免 server 本地时区漂移 session 过期
+        expires_at = datetime.now(UTC) + timedelta(days=SESSION_DAYS)
+
+        # P2-2: 并发会话上限 20，超出时驱逐最旧的会话
+        active_count = db.execute(
+            "select count(*) as n from sessions where user_id = %s and expires_at > now()",
+            (row["id"],),
+        ).fetchone()["n"]
+        if active_count >= 20:
+            evict_count = int(active_count) - 19
+            db.execute(
+                """
+                delete from sessions where id in (
+                  select id from sessions
+                  where user_id = %s and expires_at > now()
+                  order by created_at asc
+                  limit %s
+                )
+                """,
+                (row["id"], evict_count),
+            )
+
+        # 安全:DB 只存 token 的 sha256 哈希,不存可直接使用的明文(拖库不得有效会话)
+        # 注: token 列保留为 '' 兼容老 schema, 后续 migration 删除该列
+        db.execute(
+            "insert into sessions(token, token_hash, user_id, expires_at) values (%s, %s, %s, %s)",
+            ("", _hash_token(token), row["id"], expires_at),
+        )
+        _record_login_success(ip, normalized)
+        return dict(row), token
+
+
+def logout(token: str | None) -> None:
+    if not token:
+        return
+    init_db()
+    with connect() as db:
+        # 仅按 token_hash 删除。旧的明文 token 兼容分支已废弃 — 拖库后不允许重放。
+        # 历史明文行需运维一次性清空（update sessions set token='' where token<>''）。
+        db.execute("delete from sessions where token_hash = %s", (_hash_token(token),))
+
+
+def user_from_token(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return None
+    init_db()
+    with connect() as db:
+        # 仅按 token_hash 查找。旧明文行已不接受 — 拖库后历史 token 立即失效。
+        # P1-1: 加 users.deactivated_at IS NULL，停用账号的 token 立即失效
+        row = db.execute(
+            """
+            select users.* from sessions
+            join users on users.id = sessions.user_id
+            where sessions.token_hash = %s
+              and sessions.expires_at > now()
+              and users.deactivated_at is null
+            """,
+            (_hash_token(token),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_user(user_id: int) -> dict[str, Any]:
+    init_db()
+    with connect() as db:
+        row = db.execute("select * from users where id = %s", (user_id,)).fetchone()
+        if not row:
+            raise ValueError("用户不存在")
+        return dict(row)
+
+
+def update_profile(user_id: int, display_name: str, bio: str) -> dict[str, Any]:
+    init_db()
+    with connect() as db:
+        row = db.execute(
+            "update users set display_name = %s, bio = %s, row_version = row_version + 1, updated_at = now() where id = %s returning *",
+            (display_name.strip(), bio.strip(), user_id),
+        ).fetchone()
+        return dict(row)
+
+
+# ── 重发验证码（限流 1/分钟/email）─────────────────────────────────────────────
+_RESEND_LAST: dict[str, float] = {}  # email_norm → last resend monotonic timestamp
+
+
+def resend_verification_code(email: str, ip: str = "") -> None:
+    """重发验证码。限流：同一邮箱 60 秒内只能触发一次。"""
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("无效邮箱")
+
+    # per-IP 发件预算:防单 IP 跨邮箱轮询放大重发(per-email 60s 冷却挡不住换邮箱)。
+    if _ip_budget_exceeded("resend:ip", ip, 10, 600):
+        raise ValueError("发送太频繁，请稍后再试")
+
+    # Redis 共享冷却(workers>1 一致;否则用户轮询不同 worker 可绕过 60s 冷却刷验证码)
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        rem = redis_bus.lock_remaining(f"resend:{email_norm}")
+        if rem and rem > 0:
+            raise ValueError(f"发送太频繁，请 {rem} 秒后再试")
+        redis_bus.lock_set(f"resend:{email_norm}", 60)
+    else:
+        now = time.monotonic()
+        last = _RESEND_LAST.get(email_norm, 0.0)
+        if now - last < 60:
+            wait = int(60 - (now - last)) + 1
+            raise ValueError(f"发送太频繁，请 {wait} 秒后再试")
+        _RESEND_LAST[email_norm] = now
+
+    init_db()
+    with connect() as db:
+        # SEC(H-7): pending 只从 Redis/进程内取(不再从 ua 列恢复 password_hash)。
+        pending = _decode_pending_register(_pending_store_get(email_norm))
+        if not pending:
+            raise ValueError("注册会话已过期，请重新注册")
+
+        pending_json = _encode_pending_register(pending)
+        _pending_store_set(email_norm, pending_json)
+
+        # 废弃旧记录，发新验证码
+        db.execute(
+            "update email_verifications set used_at = now() where lower(email) = %s and used_at is null and purpose = 'register'",
+            (email_norm,),
+        )
+        code = generate_email_code(6)
+        code_h = hash_email_code(code)
+        from datetime import timedelta as _td
+        expires_at = datetime.now(UTC) + _td(minutes=10)
+        db.execute(
+            "insert into email_verifications (email, code_hash, purpose, expires_at, ip, ua) values (%s, %s, 'register', %s, %s, %s)",
+            # SEC(H-7): ua 列存真实 user-agent,不再塞含 password_hash 的 pending_json。
+            (email_norm, code_h, expires_at, ip or "", str(pending.get("ua") or "")[:512]),
+        )
+
+    from .email import EmailSendError, send_verification_email
+    try:
+        send_verification_email(email_norm, code)
+    except EmailSendError:
+        _log.warning("resend_verification_code: email send failed for %s", email_norm)  # SEC(M-10)
+
+
+# ── 密码重置（忘记密码）────────────────────────────────────────────────────────
+#
+# 复用 email_verifications 表（purpose='password_reset'），不新建独立表。
+# 字段映射: email / code_hash(存 token HMAC) / expires_at / used_at / user_id
+# user_id 列在 email_verifications 是否存在需运行时检查；若无则只用 email 关联。
+#
+_RESET_RATE: dict[str, float] = {}   # email_norm → 最近触发时间（防 spam）
+_RESET_RATE_LOCK = threading.Lock()
+_RESET_MAX_PER_10MIN = 3             # 每邮箱 10 分钟内最多 3 次请求
+
+
+def _check_reset_rate(email_norm: str) -> None:
+    """超过频率限制时抛 ValueError（调用方展示通用 ok 以防枚举）。"""
+    _interval = int(600 / _RESET_MAX_PER_10MIN)  # 每次请求间隔 ≥200s
+    # Redis 共享冷却(workers>1 一致;否则轮询不同 worker 可绕过重置限流刷邮件)
+    import redis_bus
+    if redis_bus.get_sync_client() is not None:
+        if (redis_bus.lock_remaining(f"reset:{email_norm}") or 0) > 0:
+            raise ValueError("rate_limited")
+        redis_bus.lock_set(f"reset:{email_norm}", _interval)
+        return
+    now = time.monotonic()
+    key = f"r:{email_norm}"
+    with _RESET_RATE_LOCK:
+        if key not in _RESET_RATE:
+            _RESET_RATE[key] = now
+            return
+        elapsed = now - _RESET_RATE[key]
+        if elapsed < _interval:  # 简单滑动阈值
+            raise ValueError("rate_limited")
+        _RESET_RATE[key] = now
+
+
+def request_password_reset(email: str, ip: str = "") -> dict:
+    """触发密码重置邮件。
+
+    - 不论 email 是否存在都返回 {'ok': True}（防枚举攻击）。
+    - 若 email 存在且已验证：写 email_verifications(purpose='password_reset')
+      并发送重置链接邮件。
+    - token TTL 30 分钟。
+    """
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        return {"ok": True}   # 静默，防枚举
+
+    try:
+        _check_reset_rate(email_norm)
+    except ValueError:
+        return {"ok": True}   # 限流也静默
+    # per-IP 预算:防单 IP 邮件轰炸(_check_reset_rate 是 per-email,换邮箱可绕)。静默 ok 防枚举。
+    if _ip_budget_exceeded("pwreset:ip", ip, 15, 600):
+        return {"ok": True}
+
+    init_db()
+    with connect() as db:
+        row = db.execute(
+            "SELECT id FROM users WHERE LOWER(email) = %s AND email_verified = true AND deactivated_at IS NULL LIMIT 1",
+            (email_norm,),
+        ).fetchone()
+        if not row:
+            return {"ok": True}   # 邮箱不存在，静默
+
+        user_id = row["id"]
+        token = secrets.token_urlsafe(32)
+        token_hash = hash_email_code(token)   # 复用已有 HMAC util
+        expires_at = datetime.now(UTC) + timedelta(minutes=30)
+
+        # 废弃同邮箱的旧 password_reset 记录
+        db.execute(
+            "UPDATE email_verifications SET used_at = NOW() "
+            "WHERE LOWER(email) = %s AND purpose = 'password_reset' AND used_at IS NULL",
+            (email_norm,),
+        )
+        # 写新记录（兼容有/无 user_id 列两种 schema）
+        try:
+            db.execute(
+                "INSERT INTO email_verifications (email, code_hash, purpose, expires_at, ip) "
+                "VALUES (%s, %s, 'password_reset', %s, %s)",
+                (email_norm, token_hash, expires_at, ip or ""),
+            )
+        except Exception:
+            _log.warning("request_password_reset: insert failed for %s", email_norm, exc_info=True)
+            return {"ok": True}
+
+    from .email import EmailSendError, send_password_reset_email
+    try:
+        send_password_reset_email(email_norm, token)
+    except EmailSendError:
+        _log.warning("request_password_reset: send email failed (RESEND unconfigured?)")
+
+    return {"ok": True}
+
+
+def consume_magic_token(token: str, email: str) -> dict:
+    """校验 magic_token 与 email 匹配，30天有效。不立即消费，verify_passwordless_and_login 时再标 used。"""
+    if not token or not email:
+        raise ValueError("token/email 不能为空")
+    norm = normalize_email(email)
+    if not norm or "@" not in norm:
+        raise ValueError("邮箱格式不正确")
+    init_db()
+    with connect() as db:
+        # SEC(H-6): 加 used_at is null —— magic 邀请单次使用,登录成功后即失效,杜绝 30 天内重放。
+        row = db.execute(
+            "select email_norm, magic_token, batch, created_at, used_by_user_id from registration_allowlist "
+            "where magic_token = %s and email_norm = %s and used_at is null",
+            (token, norm),
+        ).fetchone()
+    if not row:
+        raise ValueError("邀请链接无效、已过期或已被使用")
+    import datetime as _dt
+    created = row["created_at"]
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=_dt.UTC)
+    age = (_dt.datetime.now(_dt.UTC) - created).total_seconds()
+    if age > 30 * 86400:
+        raise ValueError("邀请链接已过期 (30天)")
+    return {"email": norm, "batch": row["batch"]}
+
+
+def request_passwordless_code(email: str, source: str = "magic_link") -> dict:
+    """对 email 发 6位 OTP。无论用户是否已注册都生效(allowlist 已在 consume_magic_token 验过)。"""
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("邮箱格式不正确")
+    init_db()
+    with connect() as db:
+        # 废弃同邮箱旧 passwordless_login 记录
+        db.execute(
+            "update email_verifications set used_at = now() "
+            "where lower(email) = %s and purpose = 'passwordless_login' and used_at is null",
+            (email_norm,),
+        )
+        code = generate_email_code(6)
+        code_h = hash_email_code(code)
+        expires_at = datetime.now(UTC) + timedelta(minutes=10)
+        db.execute(
+            """
+            insert into email_verifications
+              (email, code_hash, purpose, expires_at, ua)
+            values (%s, %s, 'passwordless_login', %s, %s)
+            """,
+            (email_norm, code_h, expires_at, source),
+        )
+    from .email import EmailSendError, send_login_code_email
+    try:
+        send_login_code_email(email_norm, code)
+    except EmailSendError:
+        _log.warning("request_passwordless_code: send email failed for %s", email_norm)  # SEC(M-10)
+    return {"ok": True}
+
+
+def verify_passwordless_and_login(email: str, code: str, ip: str = "") -> dict:
+    """验证 OTP(purpose='passwordless_login')，若用户不存在则按白名单建 user，返回 session token。"""
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("邮箱格式不正确")
+    code = (code or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        raise ValueError("请输入 6 位数字验证码")
+    # [Fix-2 round-3-P2] 镜像 confirm_login_code 的 per-email 验证码暴破防护:
+    # 无此则 passwordless 路径可对单邮箱无限猜码(仅受 IP 速率限,换 IP 即绕过)。
+    if _verify_locked(email_norm):
+        raise ValueError("验证尝试次数过多，请稍后重新获取验证码")
+    _check_rate_limit(ip, email_norm)
+    init_db()
+    with connect() as db:
+        # Step 1: 取最新未消费记录（仅用于 hash 比对，尚未消费）
+        verif = db.execute(
+            """
+            select id, code_hash from email_verifications
+            where lower(email) = %s
+              and purpose = 'passwordless_login'
+              and used_at is null
+              and expires_at > now()
+            order by created_at desc
+            limit 1
+            """,
+            (email_norm,),
+        ).fetchone()
+        if not verif or not verify_email_code(code, verif["code_hash"]):
+            # 错码或无记录：不消费，只计失败
+            _record_verify_fail(email_norm)  # [Fix-2 round-3-P2] per-email 验证码失败计数(达上限锁定该 email)
+            _record_login_fail(ip, email_norm)
+            raise ValueError("验证码错误或已过期")
+
+        # Step 2: 原子消费 — WHERE 里重检 used_at IS NULL，并发第二个请求命中 0 行
+        # SEC: hash 已在 Step 1 比对通过才到这里，此处只做 CAS 式消费。
+        consumed = db.execute(
+            "UPDATE email_verifications SET used_at = NOW() "
+            "WHERE id = %s AND used_at IS NULL "
+            "RETURNING id",
+            (verif["id"],),
+        ).fetchone()
+        if not consumed:
+            # 并发重放：第一个请求已消费
+            _record_login_fail(ip, email_norm)
+            raise ValueError("验证码错误或已过期")
+
+        # 查是否已有用户
+        user_row = db.execute(
+            """
+            select * from users
+            where lower(email) = %s and deactivated_at is null
+            limit 1
+            """,
+            (email_norm,),
+        ).fetchone()
+
+        if user_row is None:
+            # 未注册 = 新建账号:先过注册闸(关闭注册一律拒,与密码注册 / Apple 一致),再查白名单。
+            # 抛错时整个事务回滚,上面消费掉的验证码也还原。
+            _assert_new_accounts_open(db)
+            # 未注册：必须在白名单里
+            wl_row = db.execute(
+                "select email_norm, batch from registration_allowlist where email_norm = %s",
+                (email_norm,),
+            ).fetchone()
+            if not wl_row:
+                _record_login_fail(ip, email_norm)
+                raise ValueError("该邮箱不在注册白名单中，请确认邀请链接正确")
+            # 建 user (password_hash = NULL — passwordless 账号)
+            try:
+                user_row = db.execute(
+                    """
+                    insert into users (
+                      username, password_hash, display_name, role,
+                      email, email_verified, email_verified_at,
+                      terms_accepted_at, age_confirmed
+                    )
+                    values (%s, NULL, %s, 'user', %s, true, now(), now(), true)
+                    returning *
+                    """,
+                    (email_norm, email_norm, email_norm),
+                ).fetchone()
+            except UniqueViolation:
+                # 极端竞态：刚才建好了，重查
+                user_row = db.execute(
+                    "select * from users where lower(email) = %s and deactivated_at is null limit 1",
+                    (email_norm,),
+                ).fetchone()
+                if not user_row:
+                    raise ValueError("注册失败，请稍后重试")
+            # 标记白名单 used
+            db.execute(
+                "update registration_allowlist set used_by_user_id = %s, used_at = now() where email_norm = %s",
+                (user_row["id"], email_norm),
+            )
+
+        user = dict(user_row)
+        token = _issue_session(db, int(user["id"]))
+        # used_at 已在上面的原子 UPDATE 消费，无需重复置
+        _record_login_success(ip, email_norm)
+
+    needs_profile = not bool((user.get("username") or "").strip()) or user.get("username") == user.get("email")
+    return {
+        "user_id": user["id"],
+        "username": user.get("username") or "",
+        "needs_profile": needs_profile,
+        "session_token": token,
+    }
+
+
+def login_via_magic_token(email: str, ip: str = "", *, magic_token: str = "") -> dict:
+    """task: magic link 直接登录(不发 OTP,token + email 匹配本身即认证)。
+
+    consume_magic_token 已校验 token + email + 30 天有效期,这里直接:
+    1. 查/建 user(未注册 → 按白名单建 passwordless 账号)
+    2. 原子消费 allowlist used_at(SEC: CAS 式，防并发重放)
+    3. _issue_session → 返 session_token + needs_profile
+
+    跟 verify_passwordless_and_login 的差异:跳过 OTP 校验(magic_token 已是认证)。
+    """
+    email_norm = normalize_email(email)
+    if not email_norm or "@" not in email_norm:
+        raise ValueError("邮箱格式不正确")
+    _check_rate_limit(ip, email_norm)
+    init_db()
+    with connect() as db:
+        user_row = db.execute(
+            "select * from users where lower(email) = %s and deactivated_at is null limit 1",
+            (email_norm,),
+        ).fetchone()
+        if user_row is None:
+            # 未注册 = 新建账号:先过注册闸(关闭注册一律拒,与密码注册 / Apple 一致)。
+            # 魔法链接只在这里被消费,拒掉时链接保持未用,重新开放注册后还能用。
+            _assert_new_accounts_open(db)
+            # 未注册:必须在白名单(magic token 已通过 consume_magic_token 校验,这里二次保险)
+            wl_row = db.execute(
+                "select email_norm, batch from registration_allowlist where email_norm = %s",
+                (email_norm,),
+            ).fetchone()
+            if not wl_row:
+                _record_login_fail(ip, email_norm)
+                raise ValueError("该邮箱不在注册白名单中,请确认邀请链接正确")
+            # 建 passwordless 账号
+            try:
+                user_row = db.execute(
+                    """
+                    insert into users (
+                      username, password_hash, display_name, role,
+                      email, email_verified, email_verified_at,
+                      terms_accepted_at, age_confirmed
+                    )
+                    values (%s, NULL, %s, 'user', %s, true, now(), now(), true)
+                    returning *
+                    """,
+                    (email_norm, email_norm, email_norm),
+                ).fetchone()
+            except UniqueViolation:
+                user_row = db.execute(
+                    "select * from users where lower(email) = %s and deactivated_at is null limit 1",
+                    (email_norm,),
+                ).fetchone()
+                if not user_row:
+                    raise ValueError("注册失败,请稍后重试")
+            # 注意：不在此处标记 allowlist used_at，交由下方原子 UPDATE 统一消费（避免双写）
+        user = dict(user_row)
+        # SEC(H-6 原子消费): 把「检查 used_at IS NULL」与「置 used_at」合到一条 UPDATE...RETURNING。
+        # magic_token 列放进 WHERE → 精确匹配本次链接，并发第二个请求 RETURNING 空即被拒。
+        # consume_magic_token 的 SELECT 校验保留作快速失败（预筛），真正消费以此原子 UPDATE 为准。
+        if magic_token:
+            consumed_ml = db.execute(
+                "UPDATE registration_allowlist SET used_by_user_id = %s, used_at = NOW() "
+                "WHERE magic_token = %s AND email_norm = %s AND used_at IS NULL "
+                "RETURNING email_norm",
+                (int(user["id"]), magic_token, email_norm),
+            ).fetchone()
+            if not consumed_ml:
+                # 并发重放：另一个请求已消费此 magic link
+                raise ValueError("邀请链接无效、已过期或已被使用")
+        else:
+            # 兜底：无 magic_token（不应走到此分支，保守幂等写）
+            db.execute(
+                "UPDATE registration_allowlist SET used_by_user_id = %s, used_at = NOW() "
+                "WHERE email_norm = %s AND used_at IS NULL",
+                (int(user["id"]), email_norm),
+            )
+        token = _issue_session(db, int(user["id"]))
+        _record_login_success(ip, email_norm)
+
+    needs_profile = not bool((user.get("username") or "").strip()) or user.get("username") == user.get("email")
+    return {
+        "user_id": user["id"],
+        "username": user.get("username") or "",
+        "needs_profile": needs_profile,
+        "session_token": token,
+    }
+
+
+def confirm_password_reset(token: str, new_password: str, ip: str = "") -> dict:
+    """验证重置 token，更新密码。
+
+    Raises:
+        ValueError: token 无效 / 已过期 / 已使用
+        ValueError: 新密码不符合策略
+    """
+    if not token:
+        raise ValueError("invalid_token")
+    if len(new_password or "") < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"密码至少 {MIN_PASSWORD_LENGTH} 位")
+    if len(new_password or "") > 1024:
+        raise ValueError("密码超长")
+
+    # SEC(L-2): per-IP 软上限,防对 reset token 的零摩擦探测 / DoS 放大(每次探针触发全表扫 + HMAC)。
+    # [round-4-P2] rate_incr 吞异常返 None(从不抛),原 except(Exception) 是死代码 → Redis 宕机时
+    #   限流完全失效。改为按返回值:None=Redis 不可用 → 进程内滑动窗口兜底。
+    import redis_bus as _rb
+    _c = _rb.rate_incr(f"pwreset:{ip or '-'}", 600)
+    if _c is None:
+        _now = time.monotonic()
+        _ipk = ip or "-"
+        with _FAIL_LOCK:
+            _b = _PWRESET_IP_BUCKETS.setdefault(_ipk, [])
+            _b.append(_now)
+            _b[:] = [t for t in _b if _now - t < _PWRESET_WINDOW_SEC]
+            _over = len(_b) > _PWRESET_IP_LIMIT
+        if _over:
+            raise ValueError("尝试过于频繁,请稍后再试")
+    elif _c > 30:
+        raise ValueError("尝试过于频繁,请稍后再试")
+
+    token_hash = hash_email_code(token)
+    init_db()
+    with connect() as db:
+        # 原子消费 token:把「检查 used_at IS NULL」与「置 used_at」合到一条 UPDATE...RETURNING,
+        # used_at IS NULL 放在 WHERE 里 → READ COMMITTED 下并发第二个请求重检谓词失败、命中 0 行,
+        # 杜绝 TOCTOU 双花(原先 SELECT→Python 判 used_at→UPDATE 三步可被并发同时通过)。
+        # 后续任一步异常 → with connect() 回滚 → used_at 还原,合法用户仍可重试。
+        verif = db.execute(
+            "UPDATE email_verifications SET used_at = NOW() "
+            "WHERE code_hash = %s AND purpose = 'password_reset' "
+            "  AND expires_at > NOW() AND used_at IS NULL "
+            "RETURNING id, email",
+            (token_hash,),
+        ).fetchone()
+        if not verif:
+            raise ValueError("重置链接无效、已过期或已使用，请重新申请")
+
+        # 查找对应用户
+        email_norm = verif["email"]
+        user = db.execute(
+            "SELECT id FROM users WHERE LOWER(email) = %s AND email_verified = true AND deactivated_at IS NULL LIMIT 1",
+            (email_norm,),
+        ).fetchone()
+        if not user:
+            raise ValueError("账号不存在或已被禁用")
+
+        pw_hash = hash_password(new_password)
+        db.execute("UPDATE users SET password_hash = %s, updated_at = NOW() WHERE id = %s",
+                   (pw_hash, user["id"]))
+        # used_at 已在上面的原子 UPDATE 消费,无需重复置
+        # 安全：重置密码后废除所有旧 session
+        db.execute("DELETE FROM sessions WHERE user_id = %s", (user["id"],))
+
+    _log.info("password_reset: user_id=%s ip=%s", user["id"], ip)
+    return {"ok": True}

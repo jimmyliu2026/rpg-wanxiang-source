@@ -1,0 +1,50 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/rpg"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      python-deps:
+        patterns: ["*"]
+    ignore:
+      # 与 npm 侧 typescript 同族:组内单成员把整组 CI 拖死。
+      # google-genai 要求 websockets<17.0(2.19.0 实测仍然),dependabot 反复顶到 17.x →
+      # 整组 ResolutionImpossible,PR 恒红。requirements.txt 里的注释拦不住它(读不懂),
+      # 这里才是真闸。google-genai 放开 <18 后,删这条并跟上 17.x。
+      - dependency-name: "websockets"
+        versions: [">=17.0"]
+      # anthropic 1.x 把 HTTP 层换成 httpx2:给 Anthropic() 传 httpx 对象会构造即 TypeError,
+      # 而我们的 SSRF 出站层 core.outbound.safe_httpx_client(28 个调用点)正是 httpx。
+      # 这是一次要连出站层一起迁的独立工程,不能混在依赖组里自动合。做完后删这条。
+      - dependency-name: "anthropic"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    groups:
+      frontend-deps:
+        patterns: ["*"]
+    ignore:
+      # typescript 7 与 i18next 的 peerOptional "^5 || ^6" 冲突,npm ci 必炸 ERESOLVE
+      # (PR#78 实锤,与 pydantic_core 同族:组内单成员把整组 CI 拖死)。
+      # i18next 放宽 peer 范围后手动解除。
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # eslint 10 与 eslint-plugin-jsx-a11y 的 peer "^3||...||^9" 冲突,npm ci 必炸 ERESOLVE
+      # (PR#108 实锤)。jsx-a11y 最新版 6.10.2 仍未支持 eslint 10 —— 是上游没跟上,不是我们的问题。
+      # 与 typescript 那条、以及 pip 侧 websockets 是同一个病:组内单成员把整组 CI 拖死。
+      # jsx-a11y 支持 eslint 10 后,删这两条(eslint 与 @eslint/js)再跟上。
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@eslint/js"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

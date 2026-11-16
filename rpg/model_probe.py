@@ -1,0 +1,1340 @@
+"""
+model_probe.py — API 探测：远端模型列表 + 可用性 + 定价
+
+提供三类能力（README 没要求但实战必备）：
+
+1. list_remote_models(api_id)
+   调用供应商 SDK 拉取真实可用模型清单，对比本地 catalog 标记 missing/extra。
+
+2. probe_availability(api_id, model_id)
+   发一条最小（1-token）请求验证 key + model 当前可用，记录延迟。
+
+3. get_pricing(api_id, model_id)
+   内置常用模型定价表（输入/输出 / 百万 token，USD）。
+   找不到时返回 None；用户可在 model_catalog 里手动覆盖 model.pricing。
+
+设计原则：
+- 不抓 HTML / 不爬官网。定价用静态表 + catalog 覆盖。
+- 探测调用走真实 SDK，结果缓存 60 秒避免 DDoS 自己。
+- 失败不抛异常，统一返回结构化错误。
+"""
+from __future__ import annotations
+
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+BASE = Path(__file__).parent
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  价格表（USD per million tokens）
+# ══════════════════════════════════════════════════════════════════════
+# 来源：各家官方公开定价（2026-05-25 校准 · task 57）。准确性责任在调用方，可被 catalog 覆盖。
+# 结构：{api_kind: {model_real_name: {"input": X, "output": Y, "context": Z, "notes": ""}}}
+#
+# 主要变更（vs 旧表 2026-05 早期校准）：
+# - Anthropic: 已是 4.x 体系，Opus 4.7 (Apr 16, 2026) 为当前 frontier
+# - OpenAI: GPT-5.5 (May 5, 2026) 替代 5.3 成为 default；保留 5.0/4.1/4o 兜底
+# - Gemini: 3.5 Flash (May 19, 2026) 实际价 $1.50/$9.00（之前表里 $0.3/$2.5 是估算误差）；3.1 Pro 是 prev flagship
+# - Qwen: 3.7-Max (May 21, 2026) 新 flagship $2.50/$7.50；3.6 Flash $0.19/$1.13
+# - DeepSeek: V4-Pro (Apr 24, 2026) 1M context $1.74/$3.48
+_STATIC_PRICING: dict[str, dict[str, dict[str, Any]]] = {
+    "anthropic": {
+        # 2026-09-04 校准(官方 Anthropic 定价表)。⚠️ 上一版(task 57)把 Opus 系列记成
+        # $15/$75 @200K —— 那是 Claude 3 Opus 时代的价,4.x 起 Opus 是 $5/$25 且上下文 1M。
+        "claude-fable-5-1":    {"input": 10.0, "output": 50.0, "context": 1000000, "notes": "Fable 5.1 · 当前最强"},
+        "claude-fable-5":      {"input": 10.0, "output": 50.0, "context": 1000000, "notes": "Fable 5"},
+        "claude-opus-5":       {"input": 5.0,  "output": 25.0, "context": 1000000, "notes": "Opus 5 · 当前 Opus 旗舰"},
+        "claude-opus-4-8":     {"input": 5.0,  "output": 25.0, "context": 1000000, "notes": "Opus 4.8"},
+        "claude-opus-4-7":     {"input": 5.0,  "output": 25.0, "context": 1000000, "notes": "Opus 4.7"},
+        "claude-opus-4-6":     {"input": 5.0,  "output": 25.0, "context": 1000000, "notes": "Opus 4.6"},
+        "claude-opus-4-5":     {"input": 5.0,  "output": 25.0, "context": 200000, "notes": "Opus 4.5"},
+        "claude-sonnet-5":     {"input": 2.0,  "output": 10.0, "context": 1000000, "notes": "Sonnet 5 · 当前 Sonnet 旗舰"},
+        "claude-sonnet-4-6":   {"input": 3.0,  "output": 15.0, "context": 1000000, "notes": "Sonnet 4.6"},
+        "claude-sonnet-4-5":   {"input": 3.0,  "output": 15.0, "context": 200000},
+        "claude-haiku-4-5":    {"input": 1.0,  "output": 5.0,  "context": 200000, "notes": "Haiku 4.5 · 2025-10"},
+        "claude-3-5-sonnet":   {"input": 3.0,  "output": 15.0, "context": 200000},
+        "claude-3-5-haiku":    {"input": 0.8,  "output": 4.0,  "context": 200000},
+    },
+    "vertex_ai": {
+        # 2026-09-04 校准(官方 Gemini 定价页)。3.8/3.7/3.6 Flash 同价,且 $0.75/$3.75 是
+        # **限时价(至 2026-12-31)**,2027-01-01 起翻倍到 $1.50/$7.50 —— 到期需回来改。
+        "gemini-3.8-flash":      {"input": 0.75, "output": 3.75, "context": 1000000, "notes": "3.8 Flash · 当前旗舰(限时价,2027-01-01 起 $1.50/$7.50)"},
+        "gemini-3.7-flash":      {"input": 0.75, "output": 3.75, "context": 1000000, "notes": "3.7 Flash(限时价,2027-01-01 起 $1.50/$7.50)"},
+        "gemini-3.6-flash":      {"input": 0.75, "output": 3.75, "context": 1000000, "notes": "3.6 Flash(限时价,2027-01-01 起 $1.50/$7.50)"},
+        "gemini-3.5-flash-lite": {"input": 0.30, "output": 2.50, "context": 1000000, "notes": "3.5 Flash-Lite · 最便宜"},
+        "gemini-3.5-flash":    {"input": 1.50,  "output": 9.00,  "context": 1000000, "notes": "3.5 Flash"},
+        "gemini-3.1-pro":      {"input": 2.00,  "output": 12.00, "context": 1000000, "notes": "3.1 Pro · prev flagship; >200K 时 $4/$18"},
+        "gemini-3-flash":      {"input": 1.50,  "output": 9.00,  "context": 1000000, "notes": "别名指向 3.5 Flash"},
+        "gemini-3-pro":        {"input": 1.25,  "output": 10.0,  "context": 2000000, "notes": "3 Pro · 旧 flagship"},
+        "gemini-2.5-flash":    {"input": 0.075, "output": 0.3,   "context": 1000000},
+        "gemini-2.5-pro":      {"input": 1.25,  "output": 5.0,   "context": 2000000},
+        "gemini-2.0-flash":    {"input": 0.075, "output": 0.3,   "context": 1000000},
+    },
+    "openai": {
+        # 2026-09-04 校准(官方 OpenAI 定价页)。GPT-6 Astra 是当前最强,GPT-5.6 三档
+        # (Sol/Terra/Luna)是主力;`gpt-5.6` 是 `gpt-5.6-sol` 的别名。上下文 1.05M。
+        # 注:官方另有 long-context 档(超长输入翻倍计价),此处记标准档。
+        "gpt-6-astra":         {"input": 10.0, "output": 50.0, "context": 1050000, "notes": "GPT-6 Astra · 当前最强"},
+        "gpt-5.6-sol":         {"input": 4.0,  "output": 20.0, "context": 1050000, "notes": "GPT-5.6 Sol · 旗舰(别名 gpt-5.6)"},
+        "gpt-5.6":             {"input": 4.0,  "output": 20.0, "context": 1050000, "notes": "= gpt-5.6-sol 别名"},
+        "gpt-5.6-terra":       {"input": 2.0,  "output": 12.0, "context": 1050000, "notes": "GPT-5.6 Terra · 均衡"},
+        "gpt-5.6-luna":        {"input": 0.20, "output": 1.20, "context": 1050000, "notes": "GPT-5.6 Luna · 廉价"},
+        "gpt-5.5":             {"input": 2.5,  "output": 10.0, "context": 400000, "notes": "GPT-5.5 · 上一代"},
+        "gpt-5.5-instant":     {"input": 1.25, "output": 5.0,  "context": 400000, "notes": "GPT-5.5 Instant · 低延迟"},
+        "gpt-5.5-pro":         {"input": 5.0,  "output": 20.0, "context": 400000, "notes": "GPT-5.5 Pro · 付费"},
+        "gpt-5.5-thinking":    {"input": 5.0,  "output": 20.0, "context": 400000, "notes": "GPT-5.5 Thinking · 推理"},
+        "gpt-5":               {"input": 2.0,  "output": 8.0,  "context": 400000, "notes": "GPT-5 · 上一代"},
+        "gpt-4.1":             {"input": 2.0,  "output": 8.0,  "context": 1000000},
+        "gpt-4o":              {"input": 2.5,  "output": 10.0, "context": 128000},
+        "gpt-4o-mini":         {"input": 0.15, "output": 0.6,  "context": 128000},
+        "gpt-4-turbo":         {"input": 10.0, "output": 30.0, "context": 128000},
+        "o1-mini":             {"input": 1.1,  "output": 4.4,  "context": 128000},
+    },
+    "openrouter": {
+        # OpenRouter 聚合，价格 = 上游 + 5% 平台费。task 57 同步刷新代表项。
+        "anthropic/claude-opus-5":       {"input": 5.25,  "output": 26.25, "context": 1000000},
+        "anthropic/claude-sonnet-5":     {"input": 2.10,  "output": 10.50, "context": 1000000},
+        "anthropic/claude-opus-4-7":     {"input": 5.25,  "output": 26.25, "context": 1000000},
+        "anthropic/claude-sonnet-4-6":   {"input": 3.15,  "output": 15.75, "context": 1000000},
+        "openai/gpt-6-astra":            {"input": 10.5,  "output": 52.5,  "context": 1050000},
+        "openai/gpt-5.6":                {"input": 4.20,  "output": 21.0,  "context": 1050000},
+        "google/gemini-3.8-flash":       {"input": 0.79,  "output": 3.94,  "context": 1000000},
+        "x-ai/grok-4.6":                 {"input": 2.10,  "output": 6.30,  "context": 500000},
+        "x-ai/grok-4.5":                 {"input": 2.10,  "output": 6.30,  "context": 500000},
+        "x-ai/grok-4.3":                 {"input": 1.31,  "output": 2.63,  "context": 1000000},
+        "openai/gpt-5.5":                {"input": 2.625, "output": 10.5,  "context": 400000},
+        "openai/gpt-4o":                 {"input": 2.625, "output": 10.5,  "context": 128000},
+        "google/gemini-3.5-flash":       {"input": 1.575, "output": 9.45,  "context": 1000000},
+        "google/gemini-3.1-pro":         {"input": 2.10,  "output": 12.60, "context": 1000000},
+        "google/gemini-2.5-pro":         {"input": 1.31,  "output": 5.25,  "context": 2000000},
+    },
+    # xAI(api.x.ai)。2026-09-04 按官方 docs.x.ai/developers/pricing 校准。
+    # ⚠️ 记的是 **<200K 上下文** 的标准档;官方对 **≥200K 的请求整单翻倍**
+    # (grok-4.6 就变 $4/$12),长文玩法要按两倍估。
+    "xai": {
+        "grok-4.6":                    {"input": 2.00, "output": 6.00, "context": 500000,  "notes": "Grok 4.6 · 2026-08-12 当前旗舰(≥200K 输入整单翻倍)"},
+        "grok-4.5":                    {"input": 2.00, "output": 6.00, "context": 500000,  "notes": "Grok 4.5(≥200K 输入整单翻倍)"},
+        "grok-4.3":                    {"input": 1.25, "output": 2.50, "context": 1000000, "notes": "Grok 4.3 · 1M 上下文(≥200K 输入整单翻倍)"},
+        "grok-4.20-0309-reasoning":    {"input": 1.25, "output": 2.50, "context": 1000000, "notes": "Grok 4.20 推理版"},
+        "grok-4.20-0309-non-reasoning":{"input": 1.25, "output": 2.50, "context": 1000000, "notes": "Grok 4.20 非推理版"},
+        "grok-4.20-multi-agent-0309":  {"input": 1.25, "output": 2.50, "context": 1000000, "notes": "Grok 4.20 多智能体"},
+        "grok-build-0.1":              {"input": 1.00, "output": 2.00, "context": 256000,  "notes": "Grok Build 0.1"},
+    },
+    # DeepSeek 直供平台(api.deepseek.com),区别于 siliconflow 转售
+    "deepseek": {
+        # 2026-09-10 校准(官方 api-docs「Models & Pricing」页)。**记的是 off-peak 价**;
+        # 官方高峰时段(UTC 周一至周五 01:00-04:00 / 06:00-10:00)整单翻倍,实际账单可能是此处两倍。
+        # 现役只剩两个 ID:deepseek-flash(= DeepSeek-V4.1-Flash)与 deepseek-v4-pro。
+        "deepseek-flash":    {"input": 0.15, "output": 0.60, "context": 1000000, "notes": "V4.1-Flash 现役 · off-peak(高峰翻倍);缓存命中 $0.003"},
+        # v4-pro 自 2026-09-14 12:00(北京)起被官方路由到 V4.1-Flash 并按 Flash 价计费,
+        # 直到 V4.1-Pro 发布为止。此处保留 Pro 自身价:重路由是临时的,且高报成本比低报安全。
+        "deepseek-v4-pro":   {"input": 0.66, "output": 1.98, "context": 1000000, "notes": "V4-Pro · off-peak(高峰翻倍);2026-09-14 起官方暂转由 V4.1-Flash 承接"},
+        # 下面两个是**已退役的旧别名**:官方仍接受,但请求实际由 V4.1-Flash 服务、按 Flash 价计费。
+        # 记 Flash 价才是用户真实账单(此前记的 $0.22/$0.66 是老 V4-Flash 价,已失真)。
+        "deepseek-v4-flash": {"input": 0.15, "output": 0.60, "context": 1000000, "notes": "旧别名 → 实由 V4.1-Flash 服务并按 Flash 价计费"},
+        "deepseek-v4-flash-vision-exp": {"input": 0.15, "output": 0.60, "context": 1000000, "notes": "旧别名 → 实由 V4.1-Flash 服务并按 Flash 价计费"},
+        # 生产日志实测到的预览别名(uid=233 在用,POST /v1/chat/completions 返 200)。非官方目录 ID,
+        # 不进菜单,只兜底定价/能力,免得这类用户「有模型没价格没能力标签」。
+        # 带日期后缀的变体(…-expires-on-0910)靠 get_pricing / get_capabilities 的最长前缀回退命中。
+        "deepseek-v4.1-flash": {"input": 0.15, "output": 0.60, "context": 1000000, "notes": "V4.1-Flash 预览别名(实测存在,非官方目录 ID)"},
+        "deepseek-v3":       {"input": 0.27, "output": 1.10, "context": 64000,  "notes": "V3 旧版 · 已随 deepseek-chat/reasoner 于 2026-07-24 退役"},
+        # 兼容驼峰大小写写法(同样已由 V4.1-Flash 承接)
+        "DeepSeek-V4-Flash": {"input": 0.15, "output": 0.60, "context": 1000000},
+        "DeepSeek-V4-Pro":   {"input": 0.66, "output": 1.98, "context": 1000000},
+    },
+    "siliconflow": {
+        # task 57: DeepSeek V4 系列（2026-04-24 发布）
+        "deepseek-ai/DeepSeek-V4-Pro":   {"input": 1.74, "output": 3.48, "context": 1000000, "notes": "DeepSeek V4-Pro · 2026-04-24 · 1.6T 参数"},
+        "deepseek-ai/DeepSeek-V4-Flash": {"input": 0.30, "output": 1.20, "context": 1000000, "notes": "DeepSeek V4-Flash · 廉价版"},
+        "deepseek-ai/DeepSeek-V3":       {"input": 0.27, "output": 1.10, "context": 64000, "notes": "V3 · 旧版"},
+        "Qwen/Qwen3.7-Max":              {"input": 2.50, "output": 7.50, "context": 1000000, "notes": "Qwen 3.7-Max · 2026-05-21"},
+        "Qwen/Qwen3.6-Flash":            {"input": 0.19, "output": 1.13, "context": 131072, "notes": "Qwen 3.6 Flash"},
+        "Qwen/Qwen2.5-72B-Instruct":     {"input": 0.55, "output": 1.65, "context": 128000},
+    },
+    "minimax": {
+        "MiniMax-M1":      {"input": 0.55,  "output": 2.20, "context": 1000000, "notes": "约合 RMB ¥4/¥16"},
+        "abab6.5s-chat":   {"input": 0.14,  "output": 0.14, "context": 245760},
+    },
+    "dashscope": {
+        # task 57: 阿里云 Model Studio 直供 Qwen 3.7 / 3.6 系列
+        # 2026-09-04:3.8-Max 系列上线(国际站美元价按官方 0-1M 档;prime 为增强档)
+        "qwen3.8-max-prime": {"input": 5.00, "output": 15.00, "context": 1000000, "notes": "Qwen 3.8-Max Prime · 当前最强(国内 ¥24/¥72)"},
+        "qwen3.8-max":     {"input": 2.50,  "output": 7.50, "context": 1000000, "notes": "Qwen 3.8-Max · 旗舰(国内 ¥12/¥36)"},
+        "qwen3.7-max":     {"input": 2.50,  "output": 7.50, "context": 1000000, "notes": "Qwen 3.7-Max · 2026-05-21"},
+        "qwen3.6-flash":   {"input": 0.19,  "output": 1.13, "context": 131072, "notes": "Qwen 3.6 Flash"},
+        "qwen-max":        {"input": 1.40,  "output": 5.6,  "context": 32000,  "notes": "旧 Qwen Max · 约合 RMB ¥10/¥40"},
+        "qwen-plus":       {"input": 0.11,  "output": 0.28, "context": 131072},
+        "qwen-turbo":      {"input": 0.04,  "output": 0.08, "context": 1000000},
+    },
+    "hunyuan": {
+        "hunyuan-turbos-latest": {"input": 0.11,  "output": 0.32, "context": 32000, "notes": "约合 RMB ¥0.8/¥2.3"},
+        "hunyuan-large":         {"input": 0.55,  "output": 1.65, "context": 28000},
+    },
+    "doubao": {
+        "doubao-1-5-pro-32k-250115":  {"input": 0.11, "output": 0.28, "context": 32000,  "notes": "约合 RMB ¥0.8/¥2"},
+        "doubao-1-5-lite-32k-250115": {"input": 0.04, "output": 0.08, "context": 32000},
+    },
+    "xiaomi_mimo": {
+        # 暂未开放公共定价
+    },
+}
+
+
+def get_pricing(api_id_or_kind: str, model_real_name: str, catalog_override: dict | None = None) -> dict[str, Any] | None:
+    """优先 catalog 中 model.pricing 字段，回退静态表。
+
+    第一个参数既可以传 api_id (siliconflow/dashscope/...) 也可以传 kind (openai_compat/...)。
+    静态价格表按 api_id 分组（不同 provider 价格不同，即使都是 openai_compat）。
+    """
+    if catalog_override and isinstance(catalog_override, dict):
+        return {**catalog_override, "source": "catalog", "unit": "USD per million tokens"}
+    table = _STATIC_PRICING.get(api_id_or_kind or "", {})
+    pricing = table.get(model_real_name)
+    if pricing:
+        return {**pricing, "source": "static", "unit": "USD per million tokens"}
+    # 最长前缀回退,只认「同一型号的日期 / 预览别名」(gemini-3.8-flash-preview-09-01、
+    # deepseek-v4.1-flash-expires-on-0910 …)。前缀命中的价格标 source="static-prefix",
+    # 与精确命中可区分。边界见 _variant_prefix_match。
+    prefix = _variant_prefix_match(table, model_real_name or "")
+    if prefix is not None:
+        return {**table[prefix], "source": "static-prefix", "unit": "USD per million tokens"}
+    return None
+
+
+# 前缀之后允许出现的「同一型号」后缀:日期、零填充修订号、预览 / 实验 / latest 标记,可串联。
+# 刻意**不认**:
+#   - 档位词(-mini / -nano / -pro / -lite / -max / -plus / -turbo / -image / -tts / -audio /
+#     -realtime / -longcontext / -instant / -thinking / -vision …)—— 那是另一个型号,价格和窗口都不同;
+#   - 紧跟的小版本号(.1 / .2 / -1 / -2,如 gpt-5 → gpt-5.1、DeepSeek-V3 → DeepSeek-V3.2、
+#     claude-sonnet-5 → claude-sonnet-5-1)—— 同样是另一个型号。
+# v1.88.0 的前缀回退没有这道边界:gpt-5-nano 被套上 gpt-5 的价(贵 40 倍),
+# siliconflow 的 DeepSeek-V3.2 被套上 V3 的 64K 窗口,喂给层预算求解器后 GM 上下文被砍到 54%。
+_VARIANT_SUFFIX_RE = re.compile(
+    r"^(?:[-_@](?:"
+    r"\d{8}|\d{6}|\d{4}-\d{2}-\d{2}|\d{2}-\d{4}|\d{2}-\d{2}|\d{4}|0\d{2}"
+    r"|preview|exp|experimental|latest|expires-on-\d{4}"
+    r"))+$",
+    re.IGNORECASE,
+)
+
+
+def _variant_prefix_match(table: dict[str, Any], name: str) -> str | None:
+    """在 table 里找 name 的最长前缀,且前缀之后只剩日期 / 预览类后缀(同一型号的别名)。
+
+    价格与上下文窗口是**档位级**数字,只能在同一型号内继承;这里故意不与 get_capabilities
+    的前缀回退对称 —— 能力(tools / reasoning / vision)是家族级特征,前缀继承本来就合理。
+    逐个前缀试:长前缀的后缀不合格就接着试更短的,全部不合格返回 None。
+    """
+    for prefix in sorted(table.keys(), key=len, reverse=True):
+        if name.startswith(prefix) and len(name) > len(prefix) \
+                and _VARIANT_SUFFIX_RE.match(name[len(prefix):]):
+            return prefix
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  远端模型列表嗅探
+# ══════════════════════════════════════════════════════════════════════
+_LIST_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}  # api_id -> (ts, models)
+
+# task 42: 每个 (api_id, real_name) 最后一次 probe_availability 的结果。
+# 让 GET /api/models 能 inject health 字段,UI 显示模型可达性。
+# value: {"status": "ok|err", "latency_ms": int, "checked_at": float, "error": str}
+_HEALTH_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+# P1-3: _HEALTH_CACHE TTL — 超过 300s 的条目视为过期,重新探测
+_HEALTH_CACHE_TTL = 300.0
+
+
+def _health_cache_get(api_id: str, real_name: str) -> dict[str, Any] | None:
+    """读 cache;超过 TTL 返回 None(触发重新探测)。"""
+    entry = _HEALTH_CACHE.get((api_id, real_name))
+    if entry is None:
+        return None
+    if time.time() - entry.get("_cached_at", 0) > _HEALTH_CACHE_TTL:
+        return None
+    return entry
+
+
+def _health_cache_set(api_id: str, real_name: str, val: dict[str, Any]) -> None:
+    """写 cache,自动附加时间戳。"""
+    _HEALTH_CACHE[(api_id, real_name)] = {**val, "_cached_at": time.time()}
+
+
+def get_health(api_id: str, real_name: str) -> dict[str, Any] | None:
+    """读最近一次 probe 结果。前端 /api/models 用它注入 health 字段。"""
+    return _health_cache_get(api_id, real_name)
+
+
+def all_health() -> dict[str, dict[str, Any]]:
+    """全量返回当前 cache 状态,UI 调试用。"""
+    return {f"{a}::{m}": v for (a, m), v in _HEALTH_CACHE.items()}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  韧性战役 · 被动失败计数(渠道健康门控)
+# ══════════════════════════════════════════════════════════════════════
+# 生产事故形态:某中转站网关连环 502 期间,模型选择器照样把挂掉的渠道端给每个用户,
+# 人人各撞一次。这里不做主动探测(不花用户 BYOK 的钱),只是把 routes/game.py 里
+# classify_provider_error 已经分类出的 upstream/ratelimit 失败**被动记下来**,滑动窗口
+# 内失败次数达到阈值时,把该 api_id 标记为 degraded,供 GET /api/models 展示 + 前端提示。
+#
+# 存储:按 (user_id, api_id) 记录失败时间戳列表(滑动窗口,超出 _FAILURE_WINDOW_SEC 的
+# 记录懒惰丢弃)。是否 degraded 按 api_id 聚合所有 user 的失败事件——事故场景是"多个不同
+# 用户各自都撞一次同一渠道",单个用户口径会漏判(该用户可能只撞了 1 次就换模型了,
+# 但另外 5 个用户也各撞了 1 次,渠道其实已经挂了)。
+#
+# 进程内 dict,不引入 redis。workers=2 下每个 worker 独立计数——同一渠道故障期间两个
+# worker 各自的请求会分别累计,阈值达成时间可能略有先后,是刻意接受的保守近似
+# (最坏情况只是"某个 worker 判定 degraded 稍晚几次失败",不影响功能正确性,换 redis
+# 共享计数是明确出圈项,见任务备注)。
+_FAILURE_WINDOW_SEC = 300.0  # 5 分钟
+_FAILURE_THRESHOLD = 3       # 窗口内 ≥3 次 → degraded
+
+# key: (user_id_or_0, api_id) -> list[timestamp]
+_FAILURE_EVENTS: dict[tuple[int, str], list[float]] = {}
+
+
+def _prune_window(events: list[float], now: float) -> list[float]:
+    """丢弃超出滑动窗口的旧时间戳,返回窗口内仍有效的列表。"""
+    cutoff = now - _FAILURE_WINDOW_SEC
+    return [ts for ts in events if ts > cutoff]
+
+
+def note_channel_failure(
+    api_id: str,
+    user_id: int | None = None,
+    clock: Any = time.time,
+) -> None:
+    """记一次 (user_id, api_id) 的 upstream/ratelimit 失败。
+
+    调用侧(routes/game.py _client_safe_error 分类为 upstream/ratelimit 时)传入
+    api_id;user_id 传当前请求用户(未登录传 None,归到 0 桶)。
+
+    clock: 可注入的时间函数,默认 time.time;测试传假 clock 避免真 sleep。
+    """
+    if not api_id:
+        return
+    now = clock()
+    key = (int(user_id or 0), api_id)
+    events = _prune_window(_FAILURE_EVENTS.get(key, []), now)
+    events.append(now)
+    _FAILURE_EVENTS[key] = events
+
+
+def note_channel_success(api_id: str, user_id: int | None = None) -> None:
+    """流式成功完成时调用,清零该 (user_id, api_id) 的失败计数。
+
+    只清当前 user 的桶(其他 user 若仍在经历故障,不应被这次成功掩盖)。
+    """
+    if not api_id:
+        return
+    key = (int(user_id or 0), api_id)
+    _FAILURE_EVENTS.pop(key, None)
+
+
+def channel_failure_count(api_id: str, clock: Any = time.time) -> int:
+    """该 api_id 在滑动窗口内的失败总数(聚合所有 user 桶)。"""
+    if not api_id:
+        return 0
+    now = clock()
+    total = 0
+    for (_uid, aid), events in list(_FAILURE_EVENTS.items()):
+        if aid != api_id:
+            continue
+        total += len(_prune_window(events, now))
+    return total
+
+
+def is_channel_degraded(api_id: str, clock: Any = time.time) -> bool:
+    """该 api_id 是否达到 degraded 阈值(窗口内 ≥3 次失败,聚合全部 user)。"""
+    return channel_failure_count(api_id, clock=clock) >= _FAILURE_THRESHOLD
+
+
+_CACHE_TTL = 60.0
+
+
+def _require_user_credential() -> bool:
+    """服务器模式强制要求 user-scoped 凭证；本地匿名允许走环境变量。"""
+    from core.config import is_server_mode as _is_server_mode
+    from core.config import require_auth as _require_auth
+    return _require_auth() or _is_server_mode()
+
+
+def _has_user_credential(user_id: int | None, api_id: str) -> bool:
+    """该 user 是否实际可用此 provider(有自己配的凭证)。
+
+    薄委托 → core.llm_backend.user_can_use_provider(单一真源)。统一后比原裸
+    get_credential 多了 vertex_ai BYOK SA 分支(vertex 凭证存 "AgentPlatform" 行下,
+    裸查 "vertex_ai" 行会漏判),供 list_remote_models 入口门控正确放行 BYOK-SA 用户。
+    """
+    from core.llm_backend import user_can_use_provider
+    return user_can_use_provider(user_id, api_id)
+
+
+def list_remote_models(
+    api_id: str,
+    force_refresh: bool = False,
+    user_id: int | None = None,
+    api_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """从供应商 SDK 拉取真实可用模型清单。
+
+    安全：服务器模式下必须传 user_id，且该 user 必须有 user_api_credentials.api_id 凭证。
+    否则禁止调用，防止用服务端凭证（vertex_sa.json / EMBED_API_KEY）替用户付费。
+
+    api_override: 显式 provider 元数据(kind/base_url 等)。用于用户自建中转站——
+    这些 provider 不在全局菜单里(绝不写全局,避免跨用户泄露),由调用方从用户
+    凭证合成后传入。
+    """
+    # 服务器模式强制：必须有 user-scoped 凭证
+    if _require_user_credential() and not _has_user_credential(user_id, api_id):
+        return {"ok": False, "error": "需要在「个人主页 → API 凭证」中配置该 provider 的 key", "models": []}
+
+    cache_key = f"{user_id or 0}::{api_id}"
+    if not force_refresh:
+        cached = _LIST_CACHE.get(cache_key)
+        if cached and (time.monotonic() - cached[0]) < _CACHE_TTL:
+            return {"ok": True, "models": cached[1], "cached": True}
+
+    from model_registry import find_api, load_model_catalog
+    if api_override:
+        api = {**api_override, "id": api_override.get("id") or api_id}
+    else:
+        catalog = load_model_catalog()
+        api = find_api(catalog, api_id)
+    if not api:
+        return {"ok": False, "error": f"api_id 不存在: {api_id}", "models": []}
+
+    # 不收编到 model_registry.api_kind:此处 api 可能是 api_override(自建中转站,不在
+    # 全局 catalog),其 kind 来自调用方合成的 override dict;api_kind 走 catalog 查会丢掉它。
+    kind = api.get("kind") or api_id
+    try:
+        if kind == "vertex_ai":
+            # 服务器模式：只有用户上传了 BYOK SA 才允许探测；否则拒绝（避免烧服务器 SA）
+            if _require_user_credential():
+                from core.vertex_sa import has_user_sa
+                if not has_user_sa(user_id):
+                    return {
+                        "ok": False,
+                        "error": "服务器模式下需先在「设置 → API & 模型 → Agent Platform」上传 Service Account JSON",
+                        "models": [],
+                    }
+            models = _list_vertex_models(api, user_id=user_id)
+        elif kind == "anthropic":
+            models = _list_anthropic_models(api, user_id=user_id)
+        elif kind in {"openai", "openai_compat"}:
+            models = _list_openai_compat_models(api, user_id=user_id)
+        else:
+            return {"ok": False, "error": f"不支持的 provider kind: {kind}", "models": []}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "models": []}
+
+    _LIST_CACHE[cache_key] = (time.monotonic(), models)
+    return {"ok": True, "models": models, "cached": False}
+
+
+def invalidate_user_api(user_id: int | None, api_id: str) -> None:
+    """凭据变更(换/删 key)后清掉该 user+api 的远程模型缓存。
+
+    _LIST_CACHE 是进程级 60s TTL,key=`{user_id}::{api_id}`。换 key 后若不清,
+    /api/models/remote 这类 force_refresh=False 的入口会在 60s 内继续返回**旧 key**
+    探测出的模型列表 → 表现为「换 key 后模型列表不刷新」(issue #22)。幂等、容错。
+    """
+    try:
+        _LIST_CACHE.pop(f"{user_id or 0}::{api_id}", None)
+    except Exception:
+        pass
+
+
+def _list_vertex_models(api: dict[str, Any], user_id: int | None = None) -> list[dict[str, Any]]:
+    """列出 Vertex 可用 Gemini 模型。user_id 非 None 时优先使用用户 BYOK SA。"""
+    from google import genai
+
+    from core.vertex_sa import load_sa_credentials
+
+    creds, project_id = load_sa_credentials(user_id)
+    if creds is None or project_id is None:
+        raise RuntimeError(
+            "未找到 Vertex Service Account。"
+            "请在「设置 → Agent Platform」上传自己的 SA JSON。"
+        )
+    client = genai.Client(vertexai=True, project=project_id, location="global", credentials=creds)
+    models = []
+    for m in client.models.list():
+        full = getattr(m, "name", "") or ""
+        if "gemini" not in full.lower():
+            continue
+        short = full.replace("publishers/google/models/", "")
+        models.append({
+            "id": short,
+            "real_name": short,
+            "full_path": full,
+            "display_name": short.replace("-", " ").title(),
+        })
+    return models
+
+
+def _resolve_provider_key(api: dict[str, Any], user_id: int | None) -> str:
+    """统一取 key：优先 user_api_credentials，本地匿名才回退 env。
+
+    委托 → platform_app.user_credentials.resolve_api_key(单一真源,自带 require_auth
+    门控:强鉴权下不回退 env)。env 回退取该 provider 的 credential_env。取不到 → 抛错,
+    保留原 raise 契约(调用方 _list_* 据此返结构化错误)。
+
+    env 回退门控用本模块的 _require_user_credential()(= require_auth() OR
+    deployment_mode∉{local,desktop,self_hosted}),比 resolve_api_key 内部仅 require_auth()
+    更严:在『RPG_REQUIRE_AUTH=0 显式 + RPG_DEPLOYMENT_MODE∈{server/prod/cloud/未知}』这个
+    角落 regime 也禁 env 回退,保留旧『生产禁 env』字面契约(上一轮 blocker ③)。做法=只在
+    _require_user_credential() 为假时才把 env_fallback 传给 resolve_api_key;为真时传空串,
+    resolve_api_key 拿不到 env key → 下方 raise。
+    """
+    return _resolve_provider_creds(api, user_id)["key"]
+
+
+def _resolve_provider_creds(api: dict[str, Any], user_id: int | None) -> dict[str, Any]:
+    """统一取 key + base_url_override + proxy（单一真源 resolve_api_key），保留 raise 契约。
+
+    返回 {"key": "...", "base_url_override": "...", "proxy": str|None}。base_url_override 是
+    user/admin 在「连接方式」里配置的 per-credential 端点覆盖（如自建中转站 / 本地 llama.cpp），
+    与 GM 运行路径（openai_compat backend: effective_base = override or base_url）取的是同一个值。
+    proxy 经 core.outbound.credential_proxy 取(本地模式才有值,服务器模式恒 None),与 GM 路径同源 ——
+    以前这里不带代理,「聊天能通、保存 key / 同步模型却超时」(反馈 #107)。
+    """
+    api_id = api.get("id") or api.get("kind") or ""
+    from platform_app.user_credentials import (
+        resolve_api_key,
+        resolved_auth_token,
+        resolved_is_usable,
+    )
+    env_fallback = "" if _require_user_credential() else (api.get("credential_env") or "")
+    result = resolve_api_key(user_id, api_id, env_fallback=env_fallback)
+    # 免鉴权(本地/自托管)凭据没有 key 也算配好了 —— 否则用户配完本地 Ollama 想「校验连接 /
+    # 拉取模型」会被这里挡住,等于配了用不了。
+    if not resolved_is_usable(result):
+        if _require_user_credential():
+            raise RuntimeError(f"未在「个人主页 → API 凭证」配置 {api_id} 的 key")
+        raise RuntimeError(f"找不到 {api_id} 的 API key（用户凭证未配置且环境变量未设）")
+    from core.outbound import credential_proxy
+    return {"key": resolved_auth_token(result),
+            "base_url_override": (result.get("base_url_override") or "").strip(),
+            "proxy": credential_proxy(result)}
+
+
+# 列模型探测的上限。SDK 默认 max_retries=2、连接超时 10s,打不通的地址单轮就要 ~31s,
+# 裸地址再补 /v1 重试一轮就是 ~62s —— 比前端 15s 超时长,于是「假保存失败」,还把单 worker 的
+# 桌面后端整个冻住(反馈 #107)。探测是用户点出来的,失败可以再点,不需要 SDK 自己重试。
+_PROBE_READ_TIMEOUT = 15.0
+_PROBE_CONNECT_TIMEOUT = 5.0
+# GM 路径探测(校验连接 / 可用性)的读超时上限。/api/models/probe 与 /api/models/validate 的
+# timeout 由请求体传入,不夹紧的话一个挂着不回的端点加一个超大 timeout 能长时间占住线程池
+# (和 GM 共用)。
+_PROBE_MAX_READ_TIMEOUT = 60.0
+# 本地模式下目标是本机 / 局域网模型(Ollama、LM Studio)时的读超时下限:第一次请求要把模型载入
+# 显存,常见十几到几十秒,按 8s / 15s / 20s 的上限会把「正在加载」误报成不可用。取 40s 是为了
+# 落在前端探测超时(45s)之内,前端先超时的话后端多等也白等。
+_PROBE_LOCAL_READ_FLOOR = 40.0
+
+
+def _probe_timeout():
+    import httpx
+    return httpx.Timeout(_PROBE_READ_TIMEOUT, connect=_PROBE_CONNECT_TIMEOUT)
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """连接类 / 超时类异常(按类继承判断,不按字符串猜)。
+
+    openai.APIConnectionError(APITimeoutError 是它的子类)、anthropic 同名类、以及裸 httpx 的
+    TransportError(ConnectError / ConnectTimeout / ReadTimeout / ProxyError …)。这类错误说明
+    地址根本连不上,换 /v1 路径也一样连不上,不该再补试一轮。
+    """
+    types: list[type] = []
+    try:
+        import httpx
+        types.append(httpx.TransportError)
+    except Exception:
+        pass
+    try:
+        import openai
+        types.append(openai.APIConnectionError)
+    except Exception:
+        pass
+    try:
+        import anthropic
+        types.append(anthropic.APIConnectionError)
+    except Exception:
+        pass
+    return bool(types) and isinstance(exc, tuple(types))
+
+
+def _is_proxy_refusal(exc: BaseException) -> bool:
+    """异常链里有没有 httpx.ProxyError(代理本身回了错误,比如 CONNECT 被拒)。
+
+    openai / anthropic SDK 把 httpx 异常包成 APIConnectionError,原异常在 __cause__ 上。
+    """
+    try:
+        import httpx
+    except Exception:
+        return False
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, httpx.ProxyError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _unreachable_error(exc: BaseException, proxy: str | None = None) -> RuntimeError:
+    """连不上时给用户的准话。proxy = 这次出站用的凭据代理(credential_proxy 的结果)。
+
+    先看是不是出站安全闸拦的(服务器模式:域名解析不到 / 解析到内网或保留地址):SDK 把闸门异常
+    包成「Connection error.」,原因在 __cause__ 上,与 provider_errors 同一个判据
+    (outbound_blocked_in_chain)。这种要把闸门原因原样说出来,不提代理 —— 服务器模式恒不走
+    用户代理,叫人去配代理是误导。
+    其余分三种说:经用户配的代理连不上(多半是代理软件没开 / 地址端口填错)、系统代理拒绝了连接、
+    直连连不上。「连接方式 / 系统代理」这条建议只给本地模式(服务器模式没有这两样可配)。
+    都和 API key、/v1 路径无关,都不该让用户去改那两样。
+    """
+    from agents.provider_errors import outbound_blocked_in_chain, redact_secrets
+    from core.outbound import _ssrf_enforced
+
+    blocked = outbound_blocked_in_chain(exc)
+    if blocked is not None:
+        return RuntimeError(
+            "这个地址被平台的出站安全检查拦下了,和 API key、/v1 路径都没有关系。"
+            "常见原因是接口地址里的域名现在解析不到,或者解析到了内网 / 保留地址。"
+            "请确认接口地址(base_url)写对了、是公网能访问的地址,过一会儿再试。"
+            f"拦截原因:{redact_secrets(blocked, limit=200)}"
+        )
+    if proxy:
+        from core.outbound import redact_proxy_url
+        return RuntimeError(
+            f"经连接方式里配的代理({redact_proxy_url(proxy)})连不上这个地址(连接超时或连接失败),"
+            "和 API key、/v1 路径都没有关系。请确认代理软件开着、代理地址和端口没填错;"
+            f"如果这个地址本来就不用代理,把连接方式改回直连。原始错误:{exc}"
+        )
+    if _is_proxy_refusal(exc):
+        return RuntimeError(
+            "连不上这个地址:系统代理(或环境变量 HTTPS_PROXY 里的代理)拒绝了这次连接,"
+            "和 API key、/v1 路径都没有关系。请检查代理软件是否正常,或者在这个供应商的"
+            f"「连接方式」里填一个能用的 HTTP 代理。原始错误:{exc}"
+        )
+    if _ssrf_enforced():
+        return RuntimeError(
+            "连不上这个地址(连接超时或连接失败),和 API key、/v1 路径都没有关系。"
+            f"请确认接口地址写对了、这个服务现在能从公网访问,过一会儿再试。原始错误:{exc}"
+        )
+    return RuntimeError(
+        "连不上这个地址(连接超时或连接失败),和 API key、/v1 路径都没有关系。"
+        "本地版如果访问这个服务需要代理,请在这个供应商的「连接方式」里选 HTTP 代理并填上代理地址,"
+        f"或者打开系统代理后再试。原始错误:{exc}"
+    )
+
+
+def bound_backend_for_probe(backend: Any, timeout_sec: float) -> None:
+    """GM backend 拿来做探测(校验连接 / 可用性嗅探)时,给它的 SDK client 套上上限。
+
+    GM 正常对话的读超时是 llm_timeout_seconds(桌面 1800s / 服务器 300s)+ SDK 默认重试 2 次,
+    用在一次性的连通性探测上,打不通的端点能把线程占好几分钟。这里换成 max_retries=0 +
+    有界 timeout 的副本(with_options 复用同一个 http_client,代理设置不丢)。
+    读超时夹在 [1, _PROBE_MAX_READ_TIMEOUT] 之间;本地模式打本机 / 局域网模型时至少
+    _PROBE_LOCAL_READ_FLOOR(冷加载)。vertex 后端的 genai client 没有 with_options,保持原样。
+    """
+    client = getattr(backend, "client", None)
+    with_options = getattr(client, "with_options", None)
+    if not callable(with_options):
+        return
+    import httpx
+
+    from core.outbound import _is_local_target, _ssrf_enforced
+    t = float(timeout_sec or _PROBE_READ_TIMEOUT)
+    base_host = getattr(getattr(client, "base_url", None), "host", None)
+    if not _ssrf_enforced() and _is_local_target(base_host):
+        t = max(t, _PROBE_LOCAL_READ_FLOOR)  # 本机模型冷加载,见 _PROBE_LOCAL_READ_FLOOR
+    t = min(max(1.0, t), _PROBE_MAX_READ_TIMEOUT)
+    backend.client = with_options(
+        timeout=httpx.Timeout(t, connect=min(_PROBE_CONNECT_TIMEOUT, t)),
+        max_retries=0,
+    )
+
+
+def _list_anthropic_models(api: dict[str, Any], user_id: int | None = None) -> list[dict[str, Any]]:
+    from anthropic import Anthropic
+
+    from core.outbound import safe_httpx_client
+    creds = _resolve_provider_creds(api, user_id)
+    client_kwargs: dict[str, Any] = {
+        "api_key": creds["key"],
+        "timeout": _probe_timeout(),
+        "max_retries": 0,
+        "http_client": safe_httpx_client(timeout=_PROBE_READ_TIMEOUT, proxy=creds["proxy"]),
+    }
+    if creds.get("base_url_override"):
+        client_kwargs["base_url"] = creds["base_url_override"]
+    client = Anthropic(**client_kwargs)
+    models = []
+    try:
+        listed = list(client.models.list())
+    except Exception as exc:
+        if _is_connection_error(exc):
+            raise _unreachable_error(exc, creds["proxy"]) from exc
+        raise
+    for m in listed:
+        models.append({
+            "id": m.id,
+            "real_name": m.id,
+            "display_name": getattr(m, "display_name", m.id),
+            "created_at": str(getattr(m, "created_at", "")),
+        })
+    return models
+
+
+def _list_openai_compat_models(api: dict[str, Any], user_id: int | None = None) -> list[dict[str, Any]]:
+    """通用 OpenAI 兼容拉模型清单，适用于 OpenAI / OpenRouter / 硅基 / 阿里 / 腾讯 / 火山 等。"""
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError("openai SDK 未安装") from exc
+    creds = _resolve_provider_creds(api, user_id)
+    key = creds["key"]
+    # 与 GM 运行路径(openai_compat backend: effective_base = override or base_url)一致:
+    # per-credential base_url_override 优先于 catalog base_url。否则用户把自建中转站 / 本地
+    # llama.cpp 地址只填在「连接方式」凭据覆盖里时,拉模型清单会打 catalog 官方端点 → 选择器
+    # 空/错(运行能跑、却看不到/选不到自己的模型)。运行/探测两路径就此对齐。
+    base_url = creds["base_url_override"] or api.get("base_url") or None
+    # 覆盖 openai SDK 默认 UA → 浏览器 UA,否则 Cloudflare 后的中转站会按 UA 拦掉(WAF 当 AI 爬虫),
+    # 表现为「拉取模型/校验连接不可访问」。详见 core.outbound_ua。
+    # SEC(H-5): base_url 用户/admin 可控(中转站)。OpenAI SDK 默认 follow_redirects=True →
+    # 攻击者端点能用 301/302 把携 Authorization 的 /v1/models 请求跳到 169.254.169.254 / 内网。
+    # 用 core.outbound.safe_httpx_client(不跟随重定向 + 传输层私网校验),与 GM 后端一致。
+    from core.outbound import safe_httpx_client
+    from core.outbound_ua import openai_default_headers
+    kwargs: dict[str, Any] = {
+        "api_key": key,
+        "default_headers": openai_default_headers(),
+        # 探测有上限:不重试 + 连接 5s / 读 15s(见 _PROBE_READ_TIMEOUT 注释)。
+        "timeout": _probe_timeout(),
+        "max_retries": 0,
+        # 凭据代理与 GM 路径同源(credential_proxy),本地版「连接方式 = HTTP 代理」在这里也生效。
+        "http_client": safe_httpx_client(timeout=_PROBE_READ_TIMEOUT, proxy=creds["proxy"]),
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = OpenAI(**kwargs)
+    models = []
+    try:
+        data = client.models.list().data
+    except Exception as exc:
+        # 连不上(超时 / 连接失败 / 代理不通):换 /v1 路径也一样连不上,不补试,直接给准话。
+        # 以前这里照样补一轮 /v1,最坏 62s,还把错误归成「base_url 可能缺 /v1」误导用户改地址。
+        if _is_connection_error(exc):
+            raise _unreachable_error(exc, creds["proxy"]) from exc
+        # 群反馈(#91,真库复现:evomap /v1/models=200、/models=403):用户常把 base_url 填成**不带版本段**
+        # 的裸地址(如 https://relay.com)→ OpenAI SDK 打 {base}/models 而非 /v1/models → 中转站 403/404 →
+        # 「配好却查不到模型」。base_url 不含 /vN 版本段时,自动补 /v1 重试一次(仅失败时、仅缺版本段时,
+        # 不掩盖真错、不动 /v1beta/openai 等已带版本的合法路径)。除连接类错误外一律照补
+        # (含 400/401/405、裸地址返回 200 HTML 页面导致的解析异常)。
+        import re as _re
+        data = None
+        if base_url and not _re.search(r"/v\d", base_url):
+            try:
+                _retry = OpenAI(**{**kwargs, "base_url": base_url.rstrip("/") + "/v1"})
+                data = _retry.models.list().data
+            except Exception:
+                data = None
+        if data is None:
+            # 区分「base_url 错」与「key 错/权限不足」—— 原来一律甩锅 base_url,把 Google 400
+            # "Please pass a valid API key"(URL 正确、是 key 无效)的用户送去改本就正确的 URL。
+            _msg = str(exc)
+            _low = _msg.lower()
+            _code = getattr(exc, "status_code", None) or getattr(
+                getattr(exc, "response", None), "status_code", None)
+            # Google AI Studio 对机房/VPS/非住宅 IP 的地区封禁:400 "User location is not
+            # supported" / FAILED_PRECONDITION。与 key/URL 无关,别让用户瞎改 key。
+            _geo_err = ("location is not supported" in _low or "user location" in _low
+                        or "failed_precondition" in _low or "failed precondition" in _low)
+            if _geo_err:
+                raise RuntimeError(
+                    f"provider 拒绝:Google 封禁了服务器所在地区/数据中心 IP(HTTP {_code or '400'} "
+                    f"「User location is not supported」)。与你的 API key、base_url 都无关 —— Google AI "
+                    f"Studio 会封机房/VPS IP。解法:给 Google 出站配支持地区的代理,或改用 Vertex AI"
+                    f"(服务账号鉴权、面向服务器,不受此限)。原始:{_msg}"
+                ) from exc
+            _key_err = (_code in (401, 403)
+                        or "api key" in _low or "api_key" in _low
+                        or "unauthorized" in _low or "permission" in _low
+                        or "invalid_argument" in _low or "invalid argument" in _low)
+            if _key_err:
+                raise RuntimeError(
+                    f"provider 拒绝列模型:API key 无效 / 被拒 / 权限不足(HTTP {_code or '400'})。"
+                    f"URL 没问题——请核对该 provider 的 API key 是否正确、未过期,对应 API 已启用,"
+                    f"且没有 IP/来源限制挡住服务器。原始错误:{_msg}"
+                ) from exc
+            # 404 = 这个 provider **根本没有** /models 这个接口,不是 base_url 写错。
+            # 群反馈(行者无疆 2026-07-28,火山方舟 Agent Plan 订阅套餐地址):原文案把 404 也
+            # 归到「base_url 可能缺 /v1」,他照着加了 /v1 —— 结果连本来能用的 chat/completions
+            # 一起 404。方舟订阅套餐地址(/api/plan/v3)确实没有 /models,手动填模型 ID 就能正常用。
+            # 所以 404 必须单独成文案:说清「没有这个接口 ≠ 地址错」,并明确劝阻加 /v1。
+            if _code == 404:
+                raise RuntimeError(
+                    "该 provider 没有提供模型列表接口(/models 返回 404)。这不是 base_url 或 "
+                    "API key 的问题 —— 手动填写模型 ID 即可正常使用(聊天接口不受影响)。"
+                    "注意:请不要为此在 base_url 后面加 /v1:有的 provider(如火山方舟订阅套餐 "
+                    "/api/plan/v3)加了会让 chat/completions 也一起 404。"
+                ) from exc
+            raise RuntimeError(
+                f"provider 拒绝列模型(base_url 可能缺 /v1 版本段,或该 provider 不支持 /v1/models): {exc}"
+            ) from exc
+    for m in data:
+        mid = getattr(m, "id", "") or getattr(m, "name", "")
+        if mid:
+            models.append({"id": mid, "real_name": mid, "display_name": mid})
+    return models
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  拉远端清单用的 provider 元数据(同步 / 校验共用)
+# ══════════════════════════════════════════════════════════════════════
+def remote_list_api_meta(
+    api_id: str, user_id: int | None, *, base_url_hint: str = "",
+) -> tuple[dict[str, Any] | None, str]:
+    """给 list_remote_models 的 api_override 合成 provider 元数据,不写全局目录。
+
+    来源:全局目录 > default_api 模板 > 用户凭据里的 base_url_override(自建中转站)。
+    base_url:用户凭据的覆盖地址优先,其次 base_url_hint(调用方请求体),最后目录默认 ——
+    与生成路径(openai_compat backend 的 effective_base)一致。全局目录里没有的 provider 按
+    openai_compat 路由,且必须有地址。返回 (meta, error);error 非空时 meta 为 None。
+
+    POST /api/models/remote/sync 与 diff_catalog(「校验连接」)共用这一份。以前只有同步会合成,
+    校验对中转站不带 api_override,全局目录里找不到 → 「api_id 不存在」,只有碰上同一进程 60s 内的
+    缓存才能成功(多 worker 下基本都失败)。
+    """
+    from model_registry import default_api_for, find_api, load_model_catalog
+
+    catalog = load_model_catalog()
+    api = find_api(catalog, api_id) or {}
+    default_api = default_api_for(api_id) or {}
+    meta_api = {**default_api, **api}
+    # 用户凭证里的 base_url_override 是「把内置 provider(如 OpenAI)指向自建中转站」的权威意图,
+    # 必须**优先**于 body / catalog 默认。否则:普通用户的 base_url 被 _redact_catalog 抹成空、
+    # 前端 body 传空 → 这里回退到 catalog 官方端点(api.openai.com),拿用户中转站的 key 打官方
+    # → 永远「不可访问」,拉到的也不是中转站的真实模型(用户反馈:拉取的模型不对)。
+    # base_url_override 在 set_credential 落库时已做 SSRF 校验(强制公网 https),这里再校验一次也会通过。
+    cred_base = ""
+    try:
+        from platform_app.user_credentials import get_credential
+        _cred = get_credential(user_id, api_id) if user_id else None
+        cred_base = (_cred or {}).get("base_url_override") or ""
+    except Exception:
+        cred_base = ""
+    base_url = cred_base or base_url_hint or meta_api.get("base_url", "")
+    # SEC(H-2): base_url_hint 由请求方控制,过去直接进 OpenAI client → SSRF 打内网/云元数据。
+    # 解析 host→IP 校验,拒私网/保留地址(catalog/已存凭证的公网 base_url 会正常通过)。
+    if base_url:
+        try:
+            from platform_app.user_credentials import _validate_base_url
+            _validate_base_url(base_url)
+        except ValueError as exc:
+            return None, str(exc)
+    # 全局没这个 provider(自建中转站)→ 必须有 base_url 才能调,且按 openai_compat 路由
+    if not api and not base_url:
+        return None, f"未知 provider「{api_id}」需先在凭证里填写 base_url"
+    kind = meta_api.get("kind") or ("openai_compat" if base_url else api_id)
+    return {
+        "id": api_id,
+        "display_name": meta_api.get("display_name") or api_id,
+        "kind": kind,
+        "credential_env": meta_api.get("credential_env", ""),
+        "base_url": base_url,
+    }, ""
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  本地 catalog vs 远端 diff
+# ══════════════════════════════════════════════════════════════════════
+def diff_catalog(api_id: str, user_id: int | None = None, *, user_view: bool = False) -> dict[str, Any]:
+    """对比本地清单和远端真实可用模型，返回 local_only / remote_only / matching。
+
+    user_view=False(管理员):本地 = 全局目录,用于维护平台内置目录。
+    user_view=True(普通用户):本地 = 该用户自己看到的清单(全局目录 + 他的 overlay)。普通用户
+    改不了全局目录,拿全局目录比出来的「新增 / 下线」对他既不真实也无从操作 —— 设置页一打开就
+    自动同步,远端模型早已在他自己的清单里,旧实现却每次都报「新增 N 个」,点「全部添加」全 403。
+    全局目录里没有的 provider(用户自建中转站)只存在于用户视图,两种模式都退到用户视图比;
+    拉远端清单时按 remote_list_api_meta 从用户凭据合成元数据(与同步同一份)。
+
+    响应的 base 如实标出这次比的是谁:'catalog' = 全局目录,'user' = 用户自己的清单。前端据它
+    决定「全部添加」写全局目录还是重新同步自己的清单、「删除」删目录条目还是自己的模型。
+    """
+    import model_registry as _mr
+    catalog = _mr.load_model_catalog()
+    in_catalog = _mr.find_api(catalog, api_id)
+    api_override = None
+    if not in_catalog:
+        api_override, meta_err = remote_list_api_meta(api_id, user_id)
+        if api_override is None:
+            return {"ok": False, "error": meta_err, "api_id": api_id}
+    remote = list_remote_models(api_id, user_id=user_id, api_override=api_override)
+    if not remote["ok"]:
+        return {"ok": False, "error": remote.get("error"), "api_id": api_id}
+    api = None if user_view else in_catalog
+    base = "catalog" if api is not None else "user"
+    if api is None and user_id:
+        api = _mr.find_api(_mr.apply_user_overlay(catalog, user_id), api_id)
+    if not api:
+        return {"ok": False, "error": f"api_id 不存在: {api_id}"}
+
+    local_ids = {m.get("real_name") for m in api.get("models", [])}
+    remote_ids = {m["real_name"] for m in remote["models"]}
+
+    return {
+        "ok": True,
+        "api_id": api_id,
+        "base": base,
+        "local_only": sorted(local_ids - remote_ids),   # catalog 里有但远端没有（可能下线）
+        "remote_only": sorted(remote_ids - local_ids),  # 远端有但 catalog 没注册
+        "matching": sorted(local_ids & remote_ids),
+        "remote_total": len(remote_ids),
+        "local_total": len(local_ids),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  可用性嗅探（发一条最小请求）
+# ══════════════════════════════════════════════════════════════════════
+
+# status_detail 枚举：
+#   ok          — 探测成功，模型可用
+#   degraded    — 探测成功但延迟高 / 响应异常（预留，暂未触发）
+#   key_expired — HTTP 401，API key 失效或未授权
+#   forbidden   — HTTP 403，API key 无权限访问该模型
+#   err         — 5xx / 网络错误 / timeout / 其他未知错误
+#   untested    — 从未探测过（健康缓存中的初始值）
+
+def _classify_probe_error(exc: Exception, err_str: str) -> str:
+    """把异常分类为 status_detail 枚举值。
+
+    各 SDK 的 HTTP 错误报法不同，统一按字符串匹配兜底。
+
+    ⚠️防误合(2026-07-15 经 54 例等价核证):本函数与 agents/provider_errors.
+    classify_provider_error(7 类权威分类器)是【粗细两套投影】,不可互相委托——
+    探测桶需要比 7 类更细的 401/403 拆分,且要识别 7 类未标记的裸串形态;
+    委托方案=双层逻辑零删减,可维护性反降。两者并存是正确终态。
+    """
+    err_lower = err_str.lower()
+    # Anthropic SDK: anthropic.AuthenticationError (status_code=401)
+    # OpenAI SDK: openai.AuthenticationError
+    # httpx: HTTPStatusError with status_code
+    cls_name = type(exc).__name__.lower()
+
+    # 优先检查异常类名
+    if "authentication" in cls_name or "unauthorized" in cls_name:
+        return "key_expired"
+    if "permission" in cls_name or "forbidden" in cls_name:
+        return "forbidden"
+
+    # 再检查 status_code 属性（openai/anthropic SDK 都有）
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        # httpx.HTTPStatusError.response.status_code
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            status_code = getattr(resp, "status_code", None)
+    if status_code is not None:
+        if status_code == 401:
+            return "key_expired"
+        if status_code == 403:
+            return "forbidden"
+        if isinstance(status_code, int) and 500 <= status_code < 600:
+            return "err"
+
+    # 字符串关键词兜底
+    if "401" in err_str or "authentication" in err_lower or "invalid api key" in err_lower or "unauthorized" in err_lower:
+        return "key_expired"
+    if "403" in err_str or "forbidden" in err_lower or "permission denied" in err_lower:
+        return "forbidden"
+    if any(kw in err_lower for kw in ("timeout", "timed out", "connection", "network", "unreachable")):
+        return "err"
+
+    return "err"
+
+
+def _probe_error_message(status_detail: str) -> str:
+    """status_detail → 用户可读说明（中文）。"""
+    return {
+        "key_expired": "API key 已失效或未授权，请在「个人主页 → API 凭证」更新密钥",
+        "forbidden": "API key 无权限访问该模型，请检查账号权限或模型授权",
+        "err": "探测失败（供应商故障或网络不可达），可稍后重试",
+        "degraded": "模型响应异常，功能可能受限",
+        "ok": "",
+        "untested": "尚未探测",
+    }.get(status_detail, "未知错误")
+
+
+def probe_availability(api_id: str, model_real_name: str | None = None, timeout_sec: int = 15, user_id: int | None = None) -> dict[str, Any]:
+    """发一条最小请求验证 (api_id, model) 是否真的能调用。
+
+    Returns:
+        {
+          "ok": True/False,
+          "latency_ms": int,
+          "response_text": str (first 80 chars),
+          "model_used": "...",
+          "error": "..." (if failed),
+        }
+    """
+    # 服务器模式强制：必须有 user-scoped 凭证才能真实发请求（避免烧服务端凭证）
+    if _require_user_credential():
+        # vertex_ai BYOK 存在 "AgentPlatform" 这个 api_id 下，需要特殊处理
+        from model_registry import api_kind
+        _kind = api_kind(api_id)
+        if _kind == "vertex_ai":
+            from core.vertex_sa import has_user_sa
+            if not has_user_sa(user_id):
+                return {
+                    "ok": False,
+                    "api_id": api_id,
+                    "latency_ms": 0,
+                    "error": "服务器模式下需先在「设置 → Agent Platform」上传 Service Account JSON 才能探测 Vertex AI",
+                }
+        elif not _has_user_credential(user_id, api_id):
+            return {
+                "ok": False,
+                "api_id": api_id,
+                "latency_ms": 0,
+                "error": "需要在「个人主页 → API 凭证」中配置该 provider 的 key 才能发探测请求",
+            }
+    from model_registry import find_api, load_model_catalog
+
+    catalog = load_model_catalog()
+    api = find_api(catalog, api_id)
+    base_err = {"api_id": api_id, "latency_ms": 0}
+    if not api:
+        return {"ok": False, "error": f"api_id 不存在: {api_id}", **base_err}
+    if not api.get("enabled"):
+        return {"ok": False, "error": "API 未启用（请在 catalog 中 enable，并确认 credential_env 已设置）", **base_err}
+
+    if not model_real_name:
+        models = api.get("models", [])
+        if not models:
+            return {"ok": False, "error": "该 API 没有注册任何 model", **base_err}
+        model_real_name = models[0].get("real_name") or models[0].get("id")
+
+    start = time.monotonic()
+    try:
+        from agents.gm import GameMaster
+        # 强制按 user 取 key；服务器模式下 user_id=None 会导致 backend 取不到 key 抛错
+        gm = GameMaster(api_id=api_id, model=model_real_name, user_id=user_id)
+        # timeout_sec 以前是死参数(函数体从没用过),探测沿用 GM 的 1800s/300s 读超时 + SDK 重试。
+        bound_backend_for_probe(gm._backend, timeout_sec)
+        text = gm._backend.call(
+            system="只回复一个字符：1",
+            messages=[{"role": "user", "content": "1"}],
+            max_tokens=8,
+        )
+        latency = int((time.monotonic() - start) * 1000)
+        result = {
+            "ok": True,
+            "status_detail": "ok",
+            "latency_ms": latency,
+            "response_text": (text or "")[:80],
+            "model_used": model_real_name,
+            "api_id": api_id,
+        }
+        # task 42: 写 health cache 让 /api/models 能 surface 状态
+        _health_cache_set(api_id, model_real_name, {
+            "status": "ok", "status_detail": "ok",
+            "latency_ms": latency,
+            "checked_at": time.time(), "error": "",
+        })
+        return result
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - start) * 1000)
+        err = str(exc)[:200]
+        status_detail = _classify_probe_error(exc, err)
+        # 兼容旧 status 字段：key_expired/forbidden 也标 status="err"
+        _health_cache_set(api_id, model_real_name, {
+            "status": "err", "status_detail": status_detail,
+            "latency_ms": latency_ms,
+            "checked_at": time.time(), "error": err,
+        })
+        return {
+            "ok": False,
+            "status_detail": status_detail,
+            "error": err,
+            "error_detail": _probe_error_message(status_detail),
+            "latency_ms": latency_ms,
+            "model_used": model_real_name,
+            "api_id": api_id,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  综合 API 健康报告
+# ══════════════════════════════════════════════════════════════════════
+def full_report(api_id: str, probe_model: bool = False, user_id: int | None = None) -> dict[str, Any]:
+    """一次性返回：模型列表 + diff + 定价 + 可选可用性"""
+    from model_registry import api_kind, find_api, load_model_catalog
+    catalog = load_model_catalog()
+    api = find_api(catalog, api_id)
+    if not api:
+        return {"ok": False, "error": f"api_id 不存在: {api_id}"}
+    kind = api_kind(api_id)  # catalog 查 kind(api 已确保来自 catalog 且非空,等价 api.get("kind") or api_id)
+
+    report = {
+        "ok": True,
+        "api_id": api_id,
+        "kind": kind,
+        "enabled": bool(api.get("enabled")),
+        "credential_present": _credential_present(api),
+        "local_catalog": [
+            {
+                "id": m.get("id"),
+                "real_name": m.get("real_name"),
+                "enabled": m.get("enabled"),
+                "pricing": (
+                    get_pricing(api_id, m.get("real_name"), m.get("pricing"))
+                    or get_pricing(kind, m.get("real_name"))
+                ),
+                "capabilities": describe_capabilities(get_capabilities(api_id, m.get("real_name"), m.get("capabilities"))),
+            }
+            for m in api.get("models", [])
+        ],
+    }
+
+    diff = diff_catalog(api_id, user_id=user_id)
+    if diff.get("ok"):
+        report["remote_models_summary"] = {
+            "remote_total": diff["remote_total"],
+            "local_total": diff["local_total"],
+            "missing_from_catalog": diff["remote_only"][:20],
+            "stale_in_catalog": diff["local_only"],
+        }
+    else:
+        report["remote_models_error"] = diff.get("error", "")
+
+    if probe_model:
+        report["availability"] = probe_availability(api_id, user_id=user_id)
+
+    return report
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  模型能力查询（capabilities）
+# ══════════════════════════════════════════════════════════════════════
+# 能力标签词典（前端可用作筛选）
+CAPABILITY_LABELS = {
+    "text":         "文本生成",
+    "streaming":    "流式输出",
+    "image_input":  "视觉输入",
+    "audio_input":  "音频输入",
+    "video_input":  "视频输入",
+    "file_input":   "文件附件",
+    "tools":        "Function Calling",
+    "json_mode":    "JSON 结构化输出",
+    "image_gen":    "图像生成",
+    "audio_gen":    "音频生成",
+    "reasoning":    "深度思考",
+    "computer_use": "电脑控制",
+    "code_exec":    "代码执行",
+    "web_search":   "联网搜索",
+}
+
+# 模型默认能力（按 real_name 前缀匹配，精确名优先）。task 57 校准。
+_CAPABILITY_DEFAULTS: dict[str, dict[str, list[str]]] = {
+    "anthropic": {
+        # 2026-09-04 校准。4.6+ / 5 系列都支持 computer_use（agentic capability）。
+        "claude-fable-5-1":  ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use", "code_exec", "web_search"],
+        "claude-fable-5":    ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use", "code_exec", "web_search"],
+        "claude-opus-5":     ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use", "code_exec", "web_search"],
+        "claude-opus-4-8":   ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use", "code_exec", "web_search"],
+        "claude-sonnet-5":   ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use", "code_exec", "web_search"],
+        "claude-opus-4-7":   ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use", "code_exec"],
+        "claude-opus-4-6":   ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use"],
+        "claude-opus-4-5":   ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning"],
+        "claude-sonnet-4-6": ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "computer_use"],
+        "claude-sonnet-4-5": ["text", "streaming", "image_input", "file_input", "tools", "json_mode"],
+        "claude-haiku-4-5":  ["text", "streaming", "image_input", "tools", "json_mode"],
+        "claude-3-5":        ["text", "streaming", "image_input", "file_input", "tools", "json_mode"],
+    },
+    "vertex_ai": {
+        # 2026-09-04 校准:3.8 Flash 是当前旗舰,3.5 Flash-Lite 是最便宜档。
+        # (前缀回退按 key 长度倒序匹配,故 flash-lite 天然先于 flash 命中,与字典顺序无关。)
+        "gemini-3.8-flash":      ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode", "reasoning", "code_exec"],
+        "gemini-3.7-flash":      ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode", "reasoning", "code_exec"],
+        "gemini-3.6-flash":      ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode", "reasoning"],
+        "gemini-3.5-flash-lite": ["text", "streaming", "image_input", "file_input", "tools", "json_mode"],
+        "gemini-3.5-flash": ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode", "reasoning"],
+        "gemini-3.1-pro":   ["text", "streaming", "image_input", "audio_input", "video_input", "file_input", "tools", "json_mode", "reasoning", "code_exec"],
+        "gemini-3-pro":     ["text", "streaming", "image_input", "audio_input", "video_input", "file_input", "tools", "json_mode", "reasoning"],
+        "gemini-3-flash":   ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode"],
+        "gemini-2.5-pro":   ["text", "streaming", "image_input", "audio_input", "video_input", "file_input", "tools", "json_mode", "reasoning"],
+        "gemini-2.5-flash": ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode"],
+        "gemini-2.0-flash": ["text", "streaming", "image_input", "tools", "json_mode"],
+    },
+    "openai": {
+        # 2026-09-04 校准:GPT-6 Astra + GPT-5.6 (Sol/Terra/Luna) family
+        "gpt-6-astra":      ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode", "reasoning", "code_exec", "web_search"],
+        "gpt-5.6-sol":      ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode", "reasoning", "code_exec", "web_search"],
+        "gpt-5.6-terra":    ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "code_exec"],
+        "gpt-5.6-luna":     ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "gpt-5.6":          ["text", "streaming", "image_input", "audio_input", "file_input", "tools", "json_mode", "reasoning", "code_exec", "web_search"],
+        "gpt-5.5-pro":      ["text", "streaming", "image_input", "audio_input", "tools", "json_mode", "reasoning", "code_exec", "web_search"],
+        "gpt-5.5-thinking": ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "gpt-5.5-instant": ["text", "streaming", "image_input", "tools", "json_mode"],
+        "gpt-5.5":          ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "gpt-5":            ["text", "streaming", "image_input", "tools", "json_mode"],
+        "gpt-4o":           ["text", "streaming", "image_input", "audio_input", "tools", "json_mode"],
+        "gpt-4o-mini":      ["text", "streaming", "image_input", "tools", "json_mode"],
+        "gpt-4-turbo":      ["text", "streaming", "image_input", "tools", "json_mode"],
+        "gpt-4.1":          ["text", "streaming", "image_input", "tools", "json_mode"],
+        "o1":               ["text", "streaming", "reasoning"],
+        "o1-mini":          ["text", "streaming", "reasoning"],
+    },
+    "openrouter": {},  # 透传上游能力，调用方需自行查 catalog
+    "siliconflow": {
+        # task 57: DeepSeek V4 / Qwen 3.7
+        "deepseek-ai/DeepSeek-V4-Pro":   ["text", "streaming", "tools", "json_mode", "reasoning", "code_exec"],
+        "deepseek-ai/DeepSeek-V4-Flash": ["text", "streaming", "tools", "json_mode"],
+        "deepseek-ai/DeepSeek-V3":       ["text", "streaming", "tools", "json_mode"],
+        "Qwen/Qwen3.7-Max":              ["text", "streaming", "image_input", "tools", "json_mode", "reasoning", "code_exec"],
+        "Qwen/Qwen3.6-Flash":            ["text", "streaming", "tools", "json_mode"],
+        "Qwen/Qwen2.5-72B-Instruct":     ["text", "streaming", "tools"],
+    },
+    "xai": {
+        # Grok 4.x 全系支持视觉 + function calling;4.6/4.5/4.3 与 4.20-reasoning 走推理。
+        "grok-4.6":                    ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "code_exec", "web_search"],
+        "grok-4.5":                    ["text", "streaming", "image_input", "file_input", "tools", "json_mode", "reasoning", "web_search"],
+        "grok-4.3":                    ["text", "streaming", "image_input", "tools", "json_mode", "reasoning", "web_search"],
+        "grok-4.20-0309-reasoning":    ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "grok-4.20-0309-non-reasoning":["text", "streaming", "image_input", "tools", "json_mode"],
+        "grok-4.20-multi-agent-0309":  ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "grok-build-0.1":              ["text", "streaming", "tools", "json_mode"],
+    },
+    "deepseek": {
+        # 直供平台(api.deepseek.com)。此前只有 siliconflow 转售侧有能力表,直供侧缺失
+        # → 直供用户的模型卡片一律拿不到能力标签。
+        # 2026-09-10 按官方能力矩阵校准:两个现役型号都默认开思考(reasoning)、都支持 tools/json;
+        # 只有 Flash 侧有 vision。三个旧别名实际都由 V4.1-Flash 服务,故能力按 V4.1-Flash 给。
+        "deepseek-flash":               ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "deepseek-v4-pro":              ["text", "streaming", "tools", "json_mode", "reasoning", "code_exec"],
+        "deepseek-v4-flash-vision-exp": ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "deepseek-v4-flash":            ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "deepseek-v4.1-flash":          ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+    },
+    "minimax":   {"MiniMax-M1": ["text", "streaming", "tools", "json_mode"]},
+    "dashscope": {
+        "qwen3.8-max-prime": ["text", "streaming", "image_input", "tools", "json_mode", "reasoning", "code_exec"],
+        "qwen3.8-max":   ["text", "streaming", "image_input", "tools", "json_mode", "reasoning", "code_exec"],
+        "qwen3.7-max":   ["text", "streaming", "image_input", "tools", "json_mode", "reasoning"],
+        "qwen3.6-flash": ["text", "streaming", "tools", "json_mode"],
+        "qwen-max":      ["text", "streaming", "tools", "json_mode"],
+        "qwen-plus":     ["text", "streaming", "tools"],
+        "qwen-turbo":    ["text", "streaming"],
+    },
+    "hunyuan":   {"hunyuan-turbos-latest": ["text", "streaming", "tools"], "hunyuan-large": ["text", "streaming", "tools"]},
+    "doubao":    {"doubao-1-5-pro-32k-250115": ["text", "streaming", "image_input", "tools"], "doubao-1-5-lite-32k-250115": ["text", "streaming"]},
+}
+
+
+# task: embedding 模型名字 heuristic — 用户本地部署的 bge / nomic / mxbai /
+# OpenAI text-embedding-* / Cohere embed-* / Voyage / Jina 等都没在 _CAPABILITY_DEFAULTS
+# 内置表,但他们名字有强模式。匹配到任一关键字 → 标记 "embedding" capability,
+# 这样 RAG 模型下拉(filter caps=["embedding"])就能展示。
+_EMBEDDING_NAME_PATTERNS = (
+    "embedding", "embed-", "-embed", "embed_",
+    "text-embedding", "bge-", "bge_",  # BAAI BGE family
+    "nomic-embed", "mxbai-embed",      # ollama / mxbai
+    "voyage-", "jina-embed",            # Voyage / Jina
+    "e5-", "gte-",                      # E5 / GTE family
+    "m3e-",                             # Moka m3e
+    "cohere.embed", "embed-multi", "embed-english",  # Cohere
+)
+
+
+def _infer_embedding_capability(model_real_name: str) -> bool:
+    """按名字判断是否 embedding 模型(用户本地部署 / OpenAI-compat catalog 外的)。"""
+    name = (model_real_name or "").lower()
+    return any(pat in name for pat in _EMBEDDING_NAME_PATTERNS)
+
+
+def is_embedding_model(model_dict_or_name: dict[str, Any] | str | None) -> bool:
+    """统一判定一个模型是否 embedding 模型。
+
+    单一来源,封装两条等价判据:
+      · 模型 dict 的 capabilities 里含 "embedding"(catalog 显式声明)
+      · OR 名字 heuristic(_infer_embedding_capability,catalog 外/未标 cap)
+
+    传 dict 时两条都查;传 str(real_name)时只走名字 heuristic。
+    供 model_registry 等处替换裸 `'embedding' in caps` 判断。
+    """
+    if isinstance(model_dict_or_name, dict):
+        caps = model_dict_or_name.get("capabilities") or []
+        if "embedding" in caps:
+            return True
+        name = model_dict_or_name.get("real_name") or model_dict_or_name.get("id") or ""
+        return _infer_embedding_capability(str(name))
+    return _infer_embedding_capability(str(model_dict_or_name or ""))
+
+
+def get_capabilities(api_id: str, model_real_name: str, catalog_override: list[str] | None = None) -> list[str]:
+    """返回模型能力清单。
+    catalog 中的 capabilities + 内置默认表 merge,去重保序。
+    embedding 模型按名字 heuristic 兜底(_CAPABILITY_DEFAULTS 内置只有 chat 模型)。
+    """
+    table = _CAPABILITY_DEFAULTS.get(api_id, {})
+    defaults: list[str] = []
+    if model_real_name in table:
+        defaults = list(table[model_real_name])
+    else:
+        for prefix in sorted(table.keys(), key=len, reverse=True):
+            if model_real_name.startswith(prefix):
+                defaults = list(table[prefix])
+                break
+    catalog = list(catalog_override or [])
+    seen = set()
+    out = []
+    for c in catalog + defaults:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    # task: 名字 heuristic 兜底加 embedding cap
+    if _infer_embedding_capability(model_real_name) and "embedding" not in seen:
+        out.append("embedding")
+        seen.add("embedding")
+    # image_gen heuristic — 模型名含图像生成关键词时自动标记
+    _IMAGE_GEN_PATTERNS = (
+        "imagen", "seedream", "wanx",
+        "dall-e", "dalle",
+        "flux",
+        "stable-diffusion", "sd3",
+        "image",
+    )
+    _name_lower = (model_real_name or "").lower()
+    if "image_gen" not in seen and any(pat in _name_lower for pat in _IMAGE_GEN_PATTERNS):
+        out.append("image_gen")
+        seen.add("image_gen")
+    # 默认值 — embedding 模型不应回到 text+streaming
+    if not out:
+        return ["text", "streaming"]
+    return out
+
+
+def describe_capabilities(caps: list[str]) -> list[dict[str, str]]:
+    """把能力代码翻译成带 label 的结构（前端直接渲染徽标）"""
+    return [{"id": c, "label": CAPABILITY_LABELS.get(c, c)} for c in caps]
+
+
+def _credential_present(api: dict[str, Any]) -> bool:
+    """轻量检查凭证是否存在（不验证有效性）。"""
+    if api.get("credential_env"):
+        return bool(os.environ.get(api["credential_env"]))
+    if api.get("credential_ref"):
+        ref = api["credential_ref"]
+        p = Path(ref) if Path(ref).is_absolute() else BASE / Path(ref).name
+        return p.exists()
+    return False

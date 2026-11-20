@@ -1,0 +1,79 @@
+"""
+test_payload_sse_lite.py
+========================
+
+回归:聊天 SSE 的 status/done 事件每轮塞整份模型目录(payload["models"])+ tools。
+前端 on_status/on_done 根本不读它们(目录另由 /api/models、/api/state 拉),纯属流量垃圾
+——用户能在「本轮 SSE 事件流」里看到 xiaomi_mimo 的「base_url 待小米发布后填入」等内部占位
+(群反馈)。且每轮多次重建 → 白跑 _redact_catalog 深拷贝 + has_credential DB 查询。
+
+不变量(锁死):
+  · _payload 有 include_catalog 开关,False 时不放 models/tools;
+  · _payload_sse = include_catalog=False;
+  · game.py 的 SSE(status/done)+ chat 管线 payload_fn 全走 _payload_sse;
+  · 仅 /api/new、/api/state 两个 JSON 引导端点保留整份目录(前端渲染选择器需要)。
+"""
+from __future__ import annotations
+
+import re
+import unittest
+from pathlib import Path
+
+PROJECT = Path(__file__).resolve().parents[2]  # rpg/
+APP_PY = (PROJECT / "app.py").read_text(encoding="utf-8")
+# game.py 已包化为 routes/game/ 子包(纯机械搬家):拼接全子模块源码,断言不变量仍成立。
+GAME_PY = "\n".join(
+    _p.read_text(encoding="utf-8") for _p in sorted((PROJECT / "routes" / "game").glob("*.py"))
+)
+
+
+class PayloadHasCatalogSwitch(unittest.TestCase):
+    def test_payload_signature_has_include_catalog(self):
+        self.assertRegex(APP_PY, r"def _payload\([^)]*\*,\s*include_catalog:\s*bool\s*=\s*True")
+
+    def test_models_tools_guarded(self):
+        # models/tools 必须都在 `if include_catalog:` 缩进块内,不再无条件塞。
+        # 块内后来插入了 models.selected 校正段(修「刷新跳 gemini」),两行不再相邻 ——
+        # 按缩进提取整块断言,并确认块外没有第二处无条件赋值。
+        m = re.search(r"^([ \t]*)if include_catalog:\n((?:\1[ \t]+.*\n|[ \t]*\n)+)", APP_PY, re.M)
+        self.assertIsNotNone(m, "app.py 缺 `if include_catalog:` 守卫块")
+        block = m.group(2)
+        self.assertRegex(block, r"payload\[\"models\"\]\s*=\s*_redact_catalog",
+                         "models 赋值必须在 include_catalog 守卫块内")
+        self.assertRegex(block, r"payload\[\"tools\"\]\s*=\s*_redact_tools",
+                         "tools 赋值必须在 include_catalog 守卫块内")
+        outside = APP_PY.replace(block, "")
+        self.assertNotRegex(outside, r"payload\[\"models\"\]\s*=\s*_redact_catalog",
+                            "守卫块外不得再有无条件 models 赋值")
+        self.assertNotRegex(outside, r"payload\[\"tools\"\]\s*=\s*_redact_tools",
+                            "守卫块外不得再有无条件 tools 赋值")
+
+    def test_payload_sse_helper_exists(self):
+        self.assertRegex(APP_PY, r"def _payload_sse\([^)]*\)[^\n]*:")
+        self.assertIn("return _payload(api_user, include_catalog=False)", APP_PY)
+
+
+class GameRouteUsesLiteOnSse(unittest.TestCase):
+    def test_status_done_sse_use_lite(self):
+        # 所有 status/done 的 SSE yield 都走 _payload_sse,且不再有 _sse(...) 配 _payload(api_user)
+        self.assertNotRegex(GAME_PY, r'_sse\("status",\s*_payload\(api_user\)\)')
+        self.assertNotRegex(GAME_PY, r'_sse\("done",\s*\{[^}]*_payload\(api_user\)')
+        self.assertGreaterEqual(len(re.findall(r'_sse\("status",\s*_payload_sse\(api_user\)\)', GAME_PY)), 1)
+
+    def test_payload_fn_bound_to_lite(self):
+        self.assertNotIn("payload_fn=_payload,", GAME_PY)
+        self.assertGreaterEqual(GAME_PY.count("payload_fn=_payload_sse,"), 1)
+
+    def test_json_bootstrap_endpoints_keep_full_catalog(self):
+        # /api/new 与 /api/state 的 JSON 响应仍用整份 _payload(前端选择器要目录)。
+        # 后续修复给这两处包了 _sanitize_payload(裸控制字符兜底),不变量不受影响。
+        # 信封已收口权威 json_response(2026-07-17 全站信封统一),守卫锚点跟随;不变量不变。
+        self.assertIn('json_response({"ok": True, "backup": backup, "state": _sanitize_payload(_payload(api_user))})', GAME_PY)
+        self.assertIn('json_response({"ok": True, "state": _sanitize_payload(_payload(api_user))})', GAME_PY)
+
+    def test_lite_imported(self):
+        self.assertIn("_payload_sse", GAME_PY)
+
+
+if __name__ == "__main__":
+    unittest.main()

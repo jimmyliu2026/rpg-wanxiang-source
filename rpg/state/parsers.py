@@ -1,0 +1,181 @@
+"""state/parsers.py — 文本解析 helpers (_split_label, _split_items, _clean_item, _split_relation, _parse_assignment, _parse_question)"""
+from __future__ import annotations
+
+import re
+
+_TRAILING_OPTION_LINE_RE = re.compile(
+    r"^\s{0,3}(?:[-*+]|\d{1,2}[.)、]|[A-Da-d][.)、])\s+(.+?)\s*$"
+)
+
+
+def _clean_item(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text).strip(" \n\t:：-—")).strip()
+
+
+def _clean_trailing_option_text(value: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(r"^\[[ xX]\]\s*", "", text)
+    for marker in ("**", "__", "*", "_"):
+        if len(text) > len(marker) * 2 and text.startswith(marker) and text.endswith(marker):
+            text = text[len(marker):-len(marker)].strip()
+    text = re.sub(r"^[（(]?[A-Da-d][）).、]\s*", "", text)
+    return text.strip(" \t-—")
+
+
+def _extract_trailing_markdown_options(text: str) -> tuple[str, list[str]]:
+    """Move a trailing markdown action list out of prose and into pending choices."""
+    lines = (text or "").splitlines()
+    idx = len(lines) - 1
+    while idx >= 0 and not lines[idx].strip():
+        idx -= 1
+    end = idx + 1
+    if end <= 0:
+        return text, []
+
+    options_reversed: list[str] = []
+    while idx >= 0:
+        match = _TRAILING_OPTION_LINE_RE.match(lines[idx])
+        if not match:
+            break
+        option = _clean_trailing_option_text(match.group(1))
+        if not option:
+            break
+        options_reversed.append(option)
+        idx -= 1
+
+    if len(options_reversed) < 2:
+        return text, []
+
+    body_lines = lines[:idx + 1]
+    while body_lines and not body_lines[-1].strip():
+        body_lines.pop()
+    body = "\n".join(body_lines).rstrip()
+    return body, list(reversed(options_reversed))[:4]
+
+
+def _split_label(text: str) -> tuple[str, str]:
+    for sep in ("：", ":"):
+        if sep in text:
+            key, value = text.split(sep, 1)
+            return _clean_item(key), _clean_item(value)
+    return text, text
+
+
+def _split_outside_brackets(text: str, delimiters: str) -> list[str]:
+    """Split only at top-level delimiters; item descriptions may contain commas."""
+    pairs = {"（": "）", "(": ")", "【": "】", "[": "]"}
+    closing = set(pairs.values())
+    depth = 0
+    parts = []
+    current = []
+    for char in text:
+        if char in pairs:
+            depth += 1
+        elif char in closing:
+            depth = max(0, depth - 1)
+        if char in delimiters and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+        else:
+            current.append(char)
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+    return parts
+
+
+def _split_items(text) -> list[str]:
+    """Bug 5 / retest #5：
+    - value 已是 list / tuple → 直接清洗（不再切）
+    - 字符串切分策略：
+      * 顿号「、」、分号「; ；」、换行 → 总是切（明确列表分隔）
+      * 中英文逗号「, ，」→ 只在结果都是『短词』（每段 ≤ 12 字、不含其他标点）时才切，
+        避免完整事件句『Cinder 在东侧轨道触发巨响，惊动了不明生物』被劈成两条。
+    """
+    if isinstance(text, (list, tuple)):
+        return [_clean_item(str(x)) for x in text if _clean_item(str(x))]
+    if text is None:
+        return []
+    raw = str(text).strip()
+    if not raw:
+        return []
+    # 1. 先用强分隔符切：顿号/分号/换行
+    strong_parts = _split_outside_brackets(raw, "、;；\n")
+    # 2. 在 strong parts 上做逗号细切，但仅当每一片都"短词样"
+    out: list[str] = []
+    for part in strong_parts:
+        sub_parts = _split_outside_brackets(part, ",，")
+        if len(sub_parts) > 1 and all(
+            len(_clean_item(s)) <= 12 and not re.search(r"[。！？!?]", s)
+            for s in sub_parts
+        ):
+            # 短词列表：例 "Torch ×1, Shortsword, Shortbow ×1"
+            out.extend(_clean_item(s) for s in sub_parts if _clean_item(s))
+        else:
+            # 含完整句号/问号/感叹号，或片段超长 → 当作整句保留
+            cleaned = _clean_item(part)
+            if cleaned:
+                out.append(cleaned)
+    return out
+
+
+def _split_relation(text: str) -> tuple[str, str]:
+    for sep in ("：", ":", "->", "→", "-"):
+        if sep in text:
+            left, right = text.split(sep, 1)
+            return _clean_item(left), _clean_item(right)
+    return "", ""
+
+
+def _parse_assignment(text: str) -> tuple[str, str]:
+    from state.path_ops import _clean_path
+    text = _clean_item(text)
+    for sep in ("+=", "=", "：", ":"):
+        if sep in text:
+            left, right = text.split(sep, 1)
+            return _clean_path(left), _clean_item(right)
+    return "", text
+
+
+def _parse_question(value: str) -> tuple[str, list[str]]:
+    text = _clean_item(value)
+    if not text:
+        return "", []
+    question = text
+    option_text = ""
+    if "｜" in text:
+        question, option_text = text.split("｜", 1)
+    elif "|" in text:
+        question, option_text = text.split("|", 1)
+    if not option_text:
+        match = re.search(r"(.*?)(?:选项|可选|choices?)[:：]\s*(.+)$", text, re.I)
+        if match:
+            question = match.group(1)
+            option_text = match.group(2)
+    if not option_text:
+        # Curator/GM often asks inline choices: "怎么办？(A) 观察 (B) 交谈".
+        # Treat the first label boundary as the start of options, so the UI can
+        # render buttons instead of a plain question blob.
+        inline = re.search(
+            r"\s*(?:\([A-Za-z0-9①-⑩]{1,3}\)|[A-Za-z0-9①-⑩]{1,3}[、,，:：.．)])\s+",
+            text,
+        )
+        if inline and inline.start() > 0:
+            question = text[:inline.start()]
+            option_text = text[inline.start():]
+    if option_text:
+        option_text = re.sub(r"^(?:选项|可选|choices?)[:：]\s*", "", option_text, flags=re.I)
+    # GM 经常按 "A、option1、B、option2、C、option3" 输出(字母/数字 label + 顿号 + 描述)。
+    # 这种 label 模式直接按 `、` split 会把 A/B/C 当作独立选项。
+    # 检测 option_text 开头是不是 label,如果是按 label 边界 split。
+    label_boundary = r"(?:\([A-Za-z0-9①-⑩]{1,3}\)|[A-Za-z0-9①-⑩]{1,3}[、,，:：.．)])"
+    label_re = re.compile(rf"^{label_boundary}")
+    if label_re.match(option_text):
+        # label 模式:按 label 边界切,丢掉 label 本身
+        raw = re.split(rf"(?:^|\s+|[、,，])\s*{label_boundary}\s*", option_text)
+    else:
+        raw = re.split(r"[、,，/]|(?:\s+or\s+)", option_text)
+    options = [_clean_item(x) for x in raw if _clean_item(x)]
+    return _clean_item(question), options[:4]
